@@ -1,0 +1,577 @@
+------------------------------------------------------------------------------------
+      name:  <unnamed>
+       log:  C:/Users/Usuario/Documents/GitHub/py_did_multiplegt_stat/stat_python/no
+> ref_results.log
+  log type:  text
+ opened on:  23 Feb 2026, 12:03:18
+
+. 
+. * Data paths
+. local gazoline "C:/Users/Usuario/Documents/GitHub/did_multiplegt_stat/STATA/gazoli
+> ne_did_multiplegt_stat.dta"
+
+. 
+. * Helper program: extract results from e() matrix
+. cap program drop extract_ref
+
+. program define extract_ref
+  1.     args test_id est matname placebo_idx
+  2.     cap confirm matrix `matname'
+  3.     if _rc != 0 {
+  4.         di "CSV_REF,`test_id',`est',.,.,.,.,.,.,`placebo_idx',matrix_not_found"
+  5.         exit
+  6.     }
+  7.     local nr = rowsof(`matname')
+  8.     local nc = colsof(`matname')
+  9.     * Row 1 = aggregated result
+.     local est_val = `matname'[1,1]
+ 10.     local se_val  = `matname'[1,2]
+ 11.     local lb_val  = .
+ 12.     local ub_val  = .
+ 13.     local sw_val  = .
+ 14.     local st_val  = .
+ 15.     if `nc' >= 3 local lb_val = `matname'[1,3]
+ 16.     if `nc' >= 4 local ub_val = `matname'[1,4]
+ 17.     if `nc' >= 5 local sw_val = `matname'[1,5]
+ 18.     if `nc' >= 6 local st_val = `matname'[1,6]
+ 19.     di "CSV_REF,`test_id',`est',`est_val',`se_val',`lb_val',`ub_val',`sw_val',`
+> st_val',`placebo_idx',"
+ 20. end
+
+. 
+. * ===========================================================================
+. * B22: ivwaoss, placebo=1
+. * IV syntax: 5th positional var = tau, estimator(iv-was)
+. * ===========================================================================
+. di _n "=== B22 ==="
+
+=== B22 ===
+
+. use "`gazoline'", clear
+
+. cap noi did_multiplegt_stat lngca id year lngpinc tau, estimator(iv-was) order(1) 
+> controls(lngpinc) placebo(1)
+--------------------------------------------------------------------------------
+                              First stage estimation
+--------------------------------------------------------------------------------
+                                  ----------------------------------------------
+                                   Number of observations     =             1632
+                                   Estimation method          =    doubly-robust
+                                   Polynomial order           =              (1)
+                                  ----------------------------------------------
+--------------------------------------------------------------------------------
+                           Weighted Average Slope (WAS)
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+         WAS |  .0056596   .0009041   .0038875   .0074317        384       1248 
+--------------------------------------------------------------------------------
+                                 Placebo(s) WAS
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+   Placebo_1 |  .0010541   .0014718  -.0018307   .0039388        178        881 
+ 
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+innerSumIV_denom2XX not found
+
+. if _rc == 0 {
+.     extract_ref B22 ivwaoss e(WAS) 0
+.     cap extract_ref B22 ivwaoss e(Placebo_1_WAS) 1
+. }
+
+. else {
+.     di "CSV_REF,B22,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc`=_rc'"
+CSV_REF,B22,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc111
+. }
+
+. 
+. * ===========================================================================
+. * B23: ivwaoss, placebo=3
+. * ===========================================================================
+. di _n "=== B23 ==="
+
+=== B23 ===
+
+. use "`gazoline'", clear
+
+. cap noi did_multiplegt_stat lngca id year lngpinc tau, estimator(iv-was) order(1) 
+> controls(lngpinc) placebo(3)
+--------------------------------------------------------------------------------
+                              First stage estimation
+--------------------------------------------------------------------------------
+                                  ----------------------------------------------
+                                   Number of observations     =             1632
+                                   Estimation method          =    doubly-robust
+                                   Polynomial order           =              (1)
+                                  ----------------------------------------------
+--------------------------------------------------------------------------------
+                           Weighted Average Slope (WAS)
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+         WAS |  .0056596   .0009041   .0038875   .0074317        384       1248 
+--------------------------------------------------------------------------------
+                                 Placebo(s) WAS
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+   Placebo_1 |  .0010541   .0014718  -.0018307   .0039388        178        881 
+   Placebo_2 | -.0017742   .0014349  -.0045866   .0010381        200        759 
+   Placebo_3 |  .0008492   .0012282  -.0015581   .0032565        234        853 
+ 
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+innerSumIV_denom2XX not found
+
+. if _rc == 0 {
+.     extract_ref B23 ivwaoss e(WAS) 0
+.     forvalues k = 1/3 {
+  2.         cap extract_ref B23 ivwaoss e(Placebo_`k'_WAS) `k'
+  3.     }
+. }
+
+. else {
+.     di "CSV_REF,B23,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc`=_rc'"
+CSV_REF,B23,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc111
+. }
+
+. 
+. * ===========================================================================
+. * D03: ivwaoss, multi-order [1,2,1,2]
+. * ===========================================================================
+. di _n "=== D03 ==="
+
+=== D03 ===
+
+. use "`gazoline'", clear
+
+. cap noi did_multiplegt_stat lngca id year lngpinc tau, estimator(iv-was) order(1 2
+>  1 2)
+--------------------------------------------------------------------------------
+                              First stage estimation
+--------------------------------------------------------------------------------
+                                  ----------------------------------------------
+                                   Number of observations     =             1632
+                                   Estimation method          =    doubly-robust
+                                   Polynomial order           =        (1 2 1 2)
+                                  ----------------------------------------------
+--------------------------------------------------------------------------------
+                           Weighted Average Slope (WAS)
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+         WAS |  .0053614   .0009095   .0035787   .0071441        384       1248 
+ 
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+innerSumIV_denom2XX not found
+
+. if _rc == 0 {
+.     extract_ref D03 ivwaoss e(WAS) 0
+. }
+
+. else {
+.     di "CSV_REF,D03,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc`=_rc'"
+CSV_REF,D03,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc111
+. }
+
+. 
+. * ===========================================================================
+. * B08: ivwaoss, by_fd=2, placebo=1 (extract level 2)
+. * ===========================================================================
+. di _n "=== B08 ==="
+
+=== B08 ===
+
+. use "`gazoline'", clear
+
+. cap noi did_multiplegt_stat lngca id year lngpinc tau, estimator(iv-was) order(1) 
+> controls(lngpinc) placebo(1) by_fd(2)
+--------------------------------------------------------------------------------
+                              First stage estimation
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+                         DeltaD in [.05; 1]
+--------------------------------------------------------------------------------
+                                  ----------------------------------------------
+                                   Number of observations     =             1430
+                                   Estimation method          =    doubly-robust
+                                   Polynomial order           =              (1)
+                                  ----------------------------------------------
+--------------------------------------------------------------------------------
+                           Weighted Average Slope (WAS)
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+         WAS |  .0076421    .002721   .0023088   .0129753        226       1204 
+--------------------------------------------------------------------------------
+                                 Placebo(s) WAS
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+   Placebo_1 |  .0062805   .0036204  -.0008154   .0133765        106        757 
+ 
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+                         DeltaD in ]1; 8]
+--------------------------------------------------------------------------------
+                                  ----------------------------------------------
+                                   Number of observations     =             1044
+                                   Estimation method          =    doubly-robust
+                                   Polynomial order           =              (1)
+                                  ----------------------------------------------
+--------------------------------------------------------------------------------
+                           Weighted Average Slope (WAS)
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+         WAS |  .0046638    .000784   .0031271   .0062005        158        886 
+--------------------------------------------------------------------------------
+                                 Placebo(s) WAS
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+   Placebo_1 | -.0018352   .0007277  -.0032615   -.000409         72        552 
+ 
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+                         DeltaZ in [.05; 1]
+--------------------------------------------------------------------------------
+innerSumIV_denom2XX not found
+
+. if _rc == 0 {
+.     * by_fd stores results in e(WAS_1), e(WAS_2)
+.     extract_ref B08_lev1 ivwaoss e(WAS_1) 0
+.     extract_ref B08_lev2 ivwaoss e(WAS_2) 0
+.     cap extract_ref B08_pl1_lev1 ivwaoss e(Placebo_1_WAS_1) 1
+.     cap extract_ref B08_pl1_lev2 ivwaoss e(Placebo_1_WAS_2) 1
+.     ereturn list
+. }
+
+. else {
+.     di "CSV_REF,B08,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc`=_rc'"
+CSV_REF,B08,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc111
+. }
+
+. 
+. * ===========================================================================
+. * E01: ivwaoss, bootstrap=50
+. * ===========================================================================
+. di _n "=== E01 ==="
+
+=== E01 ===
+
+. use "`gazoline'", clear
+
+. set seed 1
+
+. cap noi did_multiplegt_stat lngca id year lngpinc tau, estimator(iv-was) order(1) 
+> bootstrap(50)
+--------------------------------------------------------------------------------
+                              First stage estimation
+--------------------------------------------------------------------------------
+                                  ----------------------------------------------
+                                   Number of observations     =             1632
+                                   Estimation method          =    doubly-robust
+                                   Polynomial order           =              (1)
+                                  ----------------------------------------------
+--------------------------------------------------------------------------------
+                           Weighted Average Slope (WAS)
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+         WAS |  .0053561    .000918   .0035569   .0071553        384       1248 
+ 
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+
+
+Bootstrap running (50)
+----+--- 1 ---+--- 2 ---+--- 3 ---+--- 4 ---+--- 5 
+innerSumIV_denom2XX not found
+
+. if _rc == 0 {
+.     extract_ref E01 ivwaoss e(WAS) 0
+. }
+
+. else {
+.     di "CSV_REF,E01,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc`=_rc'"
+CSV_REF,E01,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc111
+. }
+
+. 
+. * ===========================================================================
+. * E03: ivwaoss, bootstrap=50, controls
+. * ===========================================================================
+. di _n "=== E03 ==="
+
+=== E03 ===
+
+. use "`gazoline'", clear
+
+. set seed 1
+
+. cap noi did_multiplegt_stat lngca id year lngpinc tau, estimator(iv-was) order(1) 
+> controls(lngpinc) bootstrap(50)
+--------------------------------------------------------------------------------
+                              First stage estimation
+--------------------------------------------------------------------------------
+                                  ----------------------------------------------
+                                   Number of observations     =             1632
+                                   Estimation method          =    doubly-robust
+                                   Polynomial order           =              (1)
+                                  ----------------------------------------------
+--------------------------------------------------------------------------------
+                           Weighted Average Slope (WAS)
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+         WAS |  .0056596   .0009041   .0038875   .0074317        384       1248 
+ 
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+
+
+Bootstrap running (50)
+----+--- 1 ---+--- 2 ---+--- 3 ---+--- 4 ---+--- 5 
+innerSumIV_denom2XX not found
+
+. if _rc == 0 {
+.     extract_ref E03 ivwaoss e(WAS) 0
+. }
+
+. else {
+.     di "CSV_REF,E03,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc`=_rc'"
+CSV_REF,E03,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc111
+. }
+
+. 
+. * ===========================================================================
+. * F03: ivwaoss, bootstrap=50, twfe
+. * ===========================================================================
+. di _n "=== F03 ==="
+
+=== F03 ===
+
+. use "`gazoline'", clear
+
+. set seed 1
+
+. cap noi did_multiplegt_stat lngca id year lngpinc tau, estimator(iv-was) order(1) 
+> bootstrap(50) twfe
+option twfe incorrectly specified
+
+. if _rc == 0 {
+.     extract_ref F03 ivwaoss e(WAS) 0
+. }
+
+. else {
+.     di "CSV_REF,F03,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc`=_rc'"
+CSV_REF,F03,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc198
+. }
+
+. 
+. * ===========================================================================
+. * G01: waoss, cross_validation
+. * ===========================================================================
+. di _n "=== G01 ==="
+
+=== G01 ===
+
+. use "`gazoline'", clear
+
+. cap noi did_multiplegt_stat lngca id year tau, estimator(was) cross_validation(alg
+> orithm(kfolds) seed(123) max_k(3))
+ 
+--------------------------------------------------------------------------------
+Cross-validation on E(Y_t - Y_{t-1}|D_{t-1}): 
+--------------------------------------------------------------------------------
+Models                  CV's Scores
+Model 1 (k=1):            .00065523
+Model 2 (k=2):            .00117025
+The first optimal order found is: k = 1
+ 
+--------------------------------------------------------------------------------
+Cross-validation on P(S_t = 0|D_{t-1}): 
+--------------------------------------------------------------------------------
+Models                  CV's Scores
+Model 1 (k=1):            .46203127
+Model 2 (k=2):            .50529356
+The first optimal order found is: k = 1
+ 
+--------------------------------------------------------------------------------
+Cross-validation on P(S+_t = 0|D_{t-1}): 
+--------------------------------------------------------------------------------
+Models                  CV's Scores
+Model 1 (k=1):            .47410599
+Model 2 (k=2):            .53213001
+The first optimal order found is: k = 1
+ 
+--------------------------------------------------------------------------------
+Cross-validation on P(S-_t = 0|D_{t-1}): 
+--------------------------------------------------------------------------------
+Models                  CV's Scores
+Model 1 (k=1):            .2057447
+Model 2 (k=2)            .20382073     Convergence not achieved.
+The command will then consider the order from the linear regression cv.
+invalid '1' 
+
+. if _rc == 0 {
+.     extract_ref G01 waoss e(WAS) 0
+. }
+
+. else {
+.     di "CSV_REF,G01,waoss,.,.,.,.,.,.,0,STATA_ERROR_rc`=_rc'"
+CSV_REF,G01,waoss,.,.,.,.,.,.,0,STATA_ERROR_rc198
+. }
+
+. 
+. * ===========================================================================
+. * G02: waoss, cross_validation, controls
+. * ===========================================================================
+. di _n "=== G02 ==="
+
+=== G02 ===
+
+. use "`gazoline'", clear
+
+. cap noi did_multiplegt_stat lngca id year tau, estimator(was) controls(lngpinc) cr
+> oss_validation(algorithm(kfolds) seed(123) max_k(3))
+ 
+--------------------------------------------------------------------------------
+Cross-validation on E(Y_t - Y_{t-1}|D_{t-1}): 
+--------------------------------------------------------------------------------
+Models                  CV's Scores
+Model 1 (k=1):            .00065523
+Model 2 (k=2):            .00117025
+The first optimal order found is: k = 1
+ 
+--------------------------------------------------------------------------------
+Cross-validation on P(S_t = 0|D_{t-1}): 
+--------------------------------------------------------------------------------
+Models                  CV's Scores
+Model 1 (k=1):            .46203127
+Model 2 (k=2):            .50529356
+The first optimal order found is: k = 1
+ 
+--------------------------------------------------------------------------------
+Cross-validation on P(S+_t = 0|D_{t-1}): 
+--------------------------------------------------------------------------------
+Models                  CV's Scores
+Model 1 (k=1):            .47410599
+Model 2 (k=2):            .53213001
+The first optimal order found is: k = 1
+ 
+--------------------------------------------------------------------------------
+Cross-validation on P(S-_t = 0|D_{t-1}): 
+--------------------------------------------------------------------------------
+Models                  CV's Scores
+Model 1 (k=1):            .2057447
+Model 2 (k=2)            .20381748     Convergence not achieved.
+The command will then consider the order from the linear regression cv.
+invalid '1' 
+
+. if _rc == 0 {
+.     extract_ref G02 waoss e(WAS) 0
+. }
+
+. else {
+.     di "CSV_REF,G02,waoss,.,.,.,.,.,.,0,STATA_ERROR_rc`=_rc'"
+CSV_REF,G02,waoss,.,.,.,.,.,.,0,STATA_ERROR_rc198
+. }
+
+. 
+. * ===========================================================================
+. * G03: ivwaoss, cross_validation
+. * ===========================================================================
+. di _n "=== G03 ==="
+
+=== G03 ===
+
+. use "`gazoline'", clear
+
+. cap noi did_multiplegt_stat lngca id year lngpinc tau, estimator(iv-was) cross_val
+> idation(algorithm(kfolds) seed(123) max_k(3))
+--------------------------------------------------------------------------------
+                              First stage estimation
+--------------------------------------------------------------------------------
+ 
+--------------------------------------------------------------------------------
+Cross-validation on E(D_t - D_{t-1}|Z_{t-1}): 
+--------------------------------------------------------------------------------
+Models                  CV's Scores
+Model 1 (k=1):            .00208581
+Model 2 (k=2):            .00293285
+The first optimal order found is: k = 1
+ 
+--------------------------------------------------------------------------------
+Cross-validation on P(S_t = 0|Z_{t-1}): 
+--------------------------------------------------------------------------------
+Models                  CV's Scores
+Model 1 (k=1):            .46203127
+Model 2 (k=2):            .50529356
+The first optimal order found is: k = 1
+ 
+--------------------------------------------------------------------------------
+Cross-validation on P(S+_t = 0|Z_{t-1}): 
+--------------------------------------------------------------------------------
+Models                  CV's Scores
+Model 1 (k=1):            .47410599
+Model 2 (k=2):            .53213001
+The first optimal order found is: k = 1
+ 
+--------------------------------------------------------------------------------
+Cross-validation on P(S-_t = 0|Z_{t-1}): 
+--------------------------------------------------------------------------------
+Models                  CV's Scores
+Model 1 (k=1):            .2057447
+Model 2 (k=2)            .20380829     Convergence not achieved.
+The command will then consider the order from the linear regression cv.
+invalid '1' 
+
+. if _rc == 0 {
+.     extract_ref G03 ivwaoss e(WAS) 0
+. }
+
+. else {
+.     di "CSV_REF,G03,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc`=_rc'"
+CSV_REF,G03,ivwaoss,.,.,.,.,.,.,0,STATA_ERROR_rc198
+. }
+
+. 
+. * ===========================================================================
+. * L03/L04: SKIP - seed-dependent (numpy vs Stata RNG differ)
+. * ===========================================================================
+. di _n "=== L03/L04 SKIPPED (seed-dependent) ==="
+
+=== L03/L04 SKIPPED (seed-dependent) ===
+
+. 
+. * ===========================================================================
+. di _n _n "=== ALL TESTS COMPLETE ==="
+
+
+=== ALL TESTS COMPLETE ===
+
+. log close
+      name:  <unnamed>
+       log:  C:/Users/Usuario/Documents/GitHub/py_did_multiplegt_stat/stat_python/no
+> ref_results.log
+  log type:  text
+ closed on:  23 Feb 2026, 12:13:43
+------------------------------------------------------------------------------------
