@@ -28,172 +28,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.stats import norm as _scipy_norm
 
-# Optional IV regression packages - imported lazily to avoid hard dependencies
-_LINEARMODELS_AVAILABLE = False
-_ECONTOOLS_AVAILABLE = False
-
-try:
-    from linearmodels.iv import IV2SLS
-    _LINEARMODELS_AVAILABLE = True
-except ImportError:
-    pass
-
-try:
-    import econtools.metrics as ecmt
-    _ECONTOOLS_AVAILABLE = True
-except ImportError:
-    pass
-
-
-# ============================================================
-# IV REGRESSION HELPER FUNCTIONS
-# ============================================================
-
-def _iv_manual_2sls(df: pd.DataFrame, y_col: str, d_col: str, z_col: str,
-                    exog_cols: list, controls: list = None) -> float:
-    """
-    Manual 2SLS implementation using two OLS regressions.
-    This is the original implementation.
-
-    Returns the coefficient on the endogenous variable D.
-    """
-    all_exog = exog_cols.copy() if exog_cols else []
-    if controls:
-        all_exog.extend(controls)
-
-    # Quote column names that contain special characters
-    def quote_col(c):
-        if any(ch in c for ch in [' ', '-', '.', '(', ')', '+']):
-            return f"Q('{c}')"
-        return c
-
-    z_quoted = quote_col(z_col)
-    d_quoted = quote_col(d_col)
-    y_quoted = quote_col(y_col)
-    exog_quoted = [quote_col(c) for c in all_exog]
-
-    # First stage: D ~ Z + exog
-    if exog_quoted:
-        fs_formula = f"{d_quoted} ~ {z_quoted} + " + " + ".join(exog_quoted)
-    else:
-        fs_formula = f"{d_quoted} ~ {z_quoted}"
-
-    fs_model = smf.ols(fs_formula, data=df).fit()
-    df = df.copy()
-    df["_D_hat_XX"] = fs_model.fittedvalues
-
-    # Second stage: Y ~ D_hat + exog
-    if exog_quoted:
-        ss_formula = f"{y_quoted} ~ _D_hat_XX + " + " + ".join(exog_quoted)
-    else:
-        ss_formula = f"{y_quoted} ~ _D_hat_XX"
-
-    ss_model = smf.ols(ss_formula, data=df).fit()
-
-    return ss_model.params.get("_D_hat_XX", np.nan)
-
-
-def _iv_linearmodels(df: pd.DataFrame, y_col: str, d_col: str, z_col: str,
-                     exog_cols: list, controls: list = None) -> float:
-    """
-    IV regression using linearmodels.IV2SLS.
-    Properly computes standard errors accounting for first-stage estimation.
-
-    Returns the coefficient on the endogenous variable D.
-    """
-    if not _LINEARMODELS_AVAILABLE:
-        raise ImportError("linearmodels package not installed. Install with: pip install linearmodels")
-
-    all_exog = ["const"] + exog_cols.copy()
-    if controls:
-        all_exog.extend(controls)
-
-    # Prepare data
-    df = df.copy()
-    df["const"] = 1.0
-
-    # Build formula: y ~ exog + [endog ~ instrument]
-    exog_str = " + ".join(all_exog)
-    formula = f"{y_col} ~ {exog_str} + [{d_col} ~ {z_col}]"
-
-    try:
-        mod = IV2SLS.from_formula(formula, data=df)
-        res = mod.fit(cov_type="unadjusted")
-        return res.params.get(d_col, np.nan)
-    except Exception:
-        # Fall back to manual 2SLS if linearmodels fails
-        return _iv_manual_2sls(df, y_col, d_col, z_col, exog_cols, controls)
-
-
-def _iv_econtools(df: pd.DataFrame, y_col: str, d_col: str, z_col: str,
-                  exog_cols: list, controls: list = None) -> float:
-    """
-    IV regression using econtools.metrics.ivreg.
-    Stata-like syntax and output.
-
-    Returns the coefficient on the endogenous variable D.
-    """
-    if not _ECONTOOLS_AVAILABLE:
-        raise ImportError("econtools package not installed. Install with: pip install econtools")
-
-    all_exog = exog_cols.copy()
-    if controls:
-        all_exog.extend(controls)
-
-    df = df.copy()
-
-    try:
-        # econtools.ivreg signature:
-        # ivreg(df, y_name, x_name, z_name, w_name, addcons=True)
-        # x_name = endogenous regressor(s)
-        # z_name = instrument(s)
-        # w_name = exogenous regressors
-        results = ecmt.ivreg(df, y_col, [d_col], [z_col], all_exog, addcons=True)
-        return results.beta.get(d_col, np.nan)
-    except Exception:
-        # Fall back to manual 2SLS if econtools fails
-        return _iv_manual_2sls(df, y_col, d_col, z_col, exog_cols, controls)
-
-
-def run_iv_regression(df: pd.DataFrame, y_col: str, d_col: str, z_col: str,
-                      exog_cols: list, controls: list = None,
-                      method: str = "manual") -> float:
-    """
-    Run IV regression using the specified method.
-
-    Parameters
-    ----------
-    df : DataFrame
-        Data for regression
-    y_col : str
-        Dependent variable column name
-    d_col : str
-        Endogenous variable column name
-    z_col : str
-        Instrument variable column name
-    exog_cols : list
-        List of exogenous regressor column names (e.g., fixed effects)
-    controls : list, optional
-        Additional control variables
-    method : str
-        IV method: "manual" (default), "linearmodels", or "econtools"
-
-    Returns
-    -------
-    float
-        Coefficient on the endogenous variable D
-    """
-    method = method.lower()
-
-    if method == "manual":
-        return _iv_manual_2sls(df, y_col, d_col, z_col, exog_cols, controls)
-    elif method == "linearmodels":
-        return _iv_linearmodels(df, y_col, d_col, z_col, exog_cols, controls)
-    elif method == "econtools":
-        return _iv_econtools(df, y_col, d_col, z_col, exog_cols, controls)
-    else:
-        raise ValueError(f"Unknown iv_method: {method}. Choose from: 'manual', 'linearmodels', 'econtools'")
-
 
 # ============================================================
 # Stata mt64s RNG — replicates Stata's `set seed` + `rnormal()`
@@ -2305,19 +2139,13 @@ def did_multiplegt_stat_main(
 
     # --- Build output table ---
     estims = ["aoss", "waoss", "ivwaoss"]
-    # Use Stata-style row names: AS, WAS, IV-WAS (not AOSS, WAOSS, IVWAOSS)
-    estim_display = {"aoss": "AS", "waoss": "WAS", "ivwaoss": "IV-WAS"}
     colnames = ["Estimate", "SE", "LB CI", "UB CI", "Switchers", "Stayers"]
     ret = np.full((3 * max_T_XX, 6), np.nan, dtype=float)
     rown = []
     for j, est in enumerate(estims, start=1):
         enabled = {"aoss": aoss_XX, "waoss": waoss_XX, "ivwaoss": ivwaoss_XX}[est]
         for p in range(1, max_T_XX + 1):
-            # Stata uses: AS, as_2, as_3 ... WAS, was_2, was_3 ... IV-WAS, iv-was_2, iv-was_3
-            if p == 1:
-                rown.append(estim_display[est])
-            else:
-                rown.append(f"{estim_display[est].lower().replace('-', '-')}_{p}")
+            rown.append(est.upper() if p == 1 else f"{est}_{p}")
             if enabled != 1:
                 continue
             if p == 1:
@@ -2528,7 +2356,6 @@ def did_multiplegt_stat(
     twfe: Union[bool, Dict[str, Any]] = False,
     seed: int = 0,
     cross_validation: Optional[Dict[str, Any]] = None,
-    iv_method: str = "manual",
 ) -> Dict[str, Any]:
     """
     Python interface for did_multiplegt_stat.
@@ -2542,7 +2369,6 @@ def did_multiplegt_stat(
     estimation_method : str - 'ra', 'ps', 'dr' (default: 'dr' without exact_match).
     order : int or list of 1/4/8 ints - Polynomial order(s). 8 ints for IV: first 4=first-stage, last 4=reduced-form.
     placebo : int - Number of placebos (0 = none).
-    iv_method : str - IV regression package: 'manual' (default, two OLS), 'linearmodels', or 'econtools'.
     controls : list of str - Control variables.
     cross_fitting : int - Number of cross-fitting folds (0 = none).
     trimming : float - Propensity score trimming threshold (0 = none).
@@ -2637,24 +2463,11 @@ def did_multiplegt_stat(
         print("Warning: order() ignored when cross_validation is specified.")
         order_scalar = 1
 
-    # Store original order for display (could be list or int)
-    # For 8-order case: first 4 are first-stage (WAS), last 4 are reduced-form (IV-WAS)
-    order_display = order  # Keep original format for display
-    if isinstance(order, (list, tuple)) and len(order) == 8:
-        # For IV-WAS with 8 orders: store separate orders for display
-        order_fs_display = list(order[:4])   # First-stage orders (1,2,3,4)
-        order_rf_display = list(order[4:])   # Reduced-form/IV-WAS orders (5,6,7,8)
-    else:
-        order_fs_display = order_display
-        order_rf_display = order_display
-
     out: Dict[str, Any] = {
         "args": {
             "Y": Y, "ID": ID, "Time": Time, "D": D, "Z": Z,
             "estimator": estimator_list, "estimation_method": estimation_method,
-            "order": order_scalar, "order_original": order_display,
-            "order_fs": order_fs_display, "order_rf": order_rf_display,
-            "noextrapolation": noextrapolation,
+            "order": order_scalar, "noextrapolation": noextrapolation,
             "placebo": placebo, "switchers": switchers,
             "disaggregate": disaggregate, "aoss_vs_waoss": aoss_vs_waoss,
             "exact_match": exact_match, "by": list(by) if by else None,
@@ -2665,7 +2478,6 @@ def did_multiplegt_stat(
             "cross_fitting": cross_fitting, "trimming": trimming,
             "on_placebo_sample": on_placebo_sample,
             "bootstrap": bootstrap, "twfe": twfe,
-            "iv_method": iv_method,
         }
     }
 
@@ -2917,14 +2729,18 @@ def _run_bootstrap(out, df_work, Y, ID, Time, D, Z, estimator_list,
                     fe_formula += " + " + " + ".join(controls)
                 try:
                     if ivwaoss_XX == 1:
-                        # IV regression using selected method (manual, linearmodels, or econtools)
+                        # Manual 2SLS: first stage D ~ Z + FE, second stage Y ~ D_hat + FE
+                        iv_fe_formula = f"{D} ~ {Z} + " + " + ".join(t_fe_cols + id_fe_cols)
+                        if controls:
+                            iv_fe_formula += " + " + " + ".join(controls)
                         df_iv = df_bt_bal.dropna(subset=[Y, D, Z]).copy()
-                        exog_cols = t_fe_cols + id_fe_cols
-                        bt_twfe_vals[i] = run_iv_regression(
-                            df=df_iv, y_col=Y, d_col=D, z_col=Z,
-                            exog_cols=exog_cols, controls=list(controls) if controls else None,
-                            method=iv_method
-                        )
+                        fs_model = smf.ols(iv_fe_formula, data=df_iv).fit()
+                        df_iv["_D_hat_XX"] = fs_model.fittedvalues
+                        ss_formula = f"{Y} ~ _D_hat_XX + " + " + ".join(t_fe_cols + id_fe_cols)
+                        if controls:
+                            ss_formula += " + " + " + ".join(controls)
+                        ss_model = smf.ols(ss_formula, data=df_iv).fit()
+                        bt_twfe_vals[i] = ss_model.params.get("_D_hat_XX", np.nan)
                     else:
                         fe_model = smf.ols(fe_formula, data=df_bt_bal.dropna(subset=[Y, D])).fit()
                         bt_twfe_vals[i] = fe_model.params.get(D, np.nan)
@@ -3066,17 +2882,12 @@ def tab_print(mat):
         print(dis)
 
 
-def strdisplay(label, value, width=46):
-    """Display a label=value line matching Stata's format with right-aligned value."""
-    # Stata format: " {it: label}" + spaces + "=" + spaces + "value"
-    # Total width is controlled by 'width' parameter
+def strdisplay(label, value):
+    ltot = 16
+    label_out = (label + " " * max(0, ltot - len(label)))[:ltot]
     v = f"{float(value):.0f}" if not isinstance(value, str) else value
-    # Calculate spacing: label on left, value on right, = in middle
-    eq_pos = width - len(str(v)) - 1  # Position of = sign
-    label_space = eq_pos - len(label) - 1
-    if label_space < 1:
-        label_space = 1
-    print(f" {label}{' ' * label_space}={' ' * 1}{v:>{len(str(v))}}")
+    value_out = (" " * max(0, ltot - len(str(v))) + str(v))[-ltot:]
+    print(f"{label_out} = {value_out}")
 
 
 def summary_did_multiplegt_stat(obj: Dict[str, Any]):
@@ -3094,17 +2905,6 @@ def summary_did_multiplegt_stat(obj: Dict[str, Any]):
         by_obj = [f"results_by_{j + 1}" for j in range(len(by_levs))]
 
     estims_map = {"aoss": 0, "waoss": 1, "ivwaoss": 2}
-    # Display names matching Stata
-    estim_titles = {
-        "aoss": "Average Slope (AS)",
-        "waoss": "Weighted Average Slope (WAS)",
-        "ivwaoss": "IV-Weighted Average Slope (IV-WAS)"
-    }
-    placebo_titles = {
-        "aoss": "Placebo(s) AS",
-        "waoss": "Placebo(s) WAS",
-        "ivwaoss": "Placebo(s) IV-WAS"
-    }
 
     for idx, key in enumerate(by_obj):
         print_obj = obj.get(key, None)
@@ -3115,67 +2915,45 @@ def summary_did_multiplegt_stat(obj: Dict[str, Any]):
             print(f"\n{'#' * 70}")
             print(f" By level: {by_levs[idx]}")
 
-        # Stata-style header with 46-char dashes
-        print(f"{' ' * 34}{'-' * 46}")
+        print(f"\n{'-' * 35}")
         table = print_obj.get("table", None)
         pairs = int(print_obj.get("pairs", 1))
 
         N = print_obj.get("N", np.nan)
-        print(f"{' ' * 35}Number of observations{' ' * 5}={' ' * (17 - len(str(int(N))))}{int(N)}")
+        strdisplay("N", N)
 
-        methods = {"ra": "reg. adjustment", "dr": "doubly-robust", "ps": "propensity-score"}
+        methods = {"ra": "Reg. Adjustment", "dr": "Doubly Robust", "ps": "Propensity Score"}
         method = args.get("estimation_method", "dr")
+        for m in ("waoss", "ivwaoss"):
+            if m in estim_list:
+                strdisplay(f"{m.upper()} Method", methods.get(method, method))
 
-        # Show estimation method - Stata shows different label for IV-WAS
-        if "ivwaoss" in estim_list:
-            print(f"{' ' * 35}IV-WAS Estimation method{' ' * 5}={' ' * 4}{methods.get(method, method)}")
-            # Show IV regression package used
-            iv_method = args.get("iv_method", "manual")
-            iv_pkg_names = {"manual": "manual 2SLS", "linearmodels": "linearmodels.IV2SLS", "econtools": "econtools.ivreg"}
-            print(f"{' ' * 35}IV regression package{' ' * 8}={' ' * 4}{iv_pkg_names.get(iv_method, iv_method)}")
-        elif "waoss" in estim_list or "aoss" in estim_list:
-            print(f"{' ' * 35}Estimation method{' ' * 10}={' ' * 4}{methods.get(method, method)}")
-
-        # Polynomial order with parentheses like Stata
-        # For IV-WAS: use order_rf (reduced-form orders, e.g., 5,6,7,8)
-        # For WAS/AS: use order_fs or order_original
         if not args.get("exact_match") and args.get("order") is not None:
-            if "ivwaoss" in estim_list:
-                # Use reduced-form orders for IV-WAS
-                order_val = args.get("order_rf", args.get("order_original", args.get("order")))
-            else:
-                # Use first-stage orders for WAS/AS
-                order_val = args.get("order_fs", args.get("order_original", args.get("order")))
-            if isinstance(order_val, (list, tuple)):
-                order_str = "(" + " ".join(str(x) for x in order_val) + ")"
-            else:
-                order_str = f"({order_val})"
-            print(f"{' ' * 34}Polynomial order{' ' * 11}={' ' * (17 - len(order_str))}{order_str}")
+            strdisplay("Polynomial Order", args.get("order"))
 
         if args.get("exact_match"):
-            print(f"{' ' * 34}Common support{' ' * 12}={' ' * 2}exact matching")
+            strdisplay("Common Support", "Exact Matching")
         if args.get("noextrapolation"):
-            print(f"{' ' * 34}Common support{' ' * 13}= no extrapolation")
-        if args.get("switchers"):
-            sw = args.get("switchers")
-            print(f"{' ' * 34}Switchers{' ' * 17}={' ' * (17 - len(sw))}{sw}")
+            strdisplay("Common Support", "No Extrapolation")
+        if args.get("controls"):
+            strdisplay("Controls", ", ".join(args["controls"]))
+        if args.get("cross_fitting", 0) > 0:
+            strdisplay("Cross-fitting", args["cross_fitting"])
+        if args.get("trimming", 0) > 0:
+            strdisplay("Trimming", args["trimming"])
 
-        print(f"{' ' * 34}{'-' * 46}")
+        print(f"{'-' * 35}")
 
         n_clusters = print_obj.get("n_clusters", None)
         if n_clusters is not None:
-            cluster_name = args.get('cluster')
-            print(f"(Std. err. adjusted for {n_clusters} clusters in {cluster_name})")
+            print(f"(Std. errors adjusted for {n_clusters} clusters in {args.get('cluster')})")
 
         for t in ("aoss", "waoss", "ivwaoss"):
             if t not in estim_list:
                 continue
-            # Stata-style section title
-            print(f"{'-' * 80}")
-            title = estim_titles[t]
-            padding = (80 - len(title)) // 2
-            print(f"{' ' * padding}{title}")
-            print(f"{'-' * 80}")
+            print(f"\n{'-' * 70}")
+            print(f"{' ' * 20}Estimation of {t.upper()}(s)")
+            print(f"{'-' * 70}")
 
             if isinstance(table, pd.DataFrame):
                 l_bound = estims_map[t] * pairs
@@ -3192,71 +2970,46 @@ def summary_did_multiplegt_stat(obj: Dict[str, Any]):
                     table_p = print_obj.get(f"table_placebo_{pl_idx}", print_obj.get("table_placebo", None))
                     if isinstance(table_p, pd.DataFrame) and estim_idx < len(table_p):
                         row = table_p.iloc[[estim_idx]].copy()
-                        # Rename to Placebo_N - Stata format
-                        row.index = [f"Placebo_{pl_idx}"]
+                        # Rename to Placebo_N or Placebo_N_estimator
+                        suffix = "" if t == "aoss" else f"_{t}"
+                        row.index = [f"Placebo_{pl_idx}{suffix}"]
                         # Skip if not computed (NaN estimate and 0 switchers)
                         if not (np.isnan(row.iloc[0]["Estimate"]) and row.iloc[0]["Switchers"] == 0):
                             pl_rows.append(row)
                 if pl_rows:
                     pl_combined = pd.concat(pl_rows)
-                    # Stata-style placebo section title
-                    print(f"{'-' * 80}")
-                    pl_title = placebo_titles[t]
-                    pl_padding = (80 - len(pl_title)) // 2
-                    print(f"{' ' * pl_padding}{pl_title}")
-                    print(f"{'-' * 80}")
+                    print(f"\n{'-' * 70}")
+                    print(f"{' ' * 15}Estimation of {t.upper()}(s) - Placebo(s)")
+                    print(f"{'-' * 70}")
                     mat_print(pl_combined)
 
         if args.get("aoss_vs_waoss"):
             diff_tab = print_obj.get("aoss_vs_waoss", None)
             if diff_tab is not None:
-                print(f" ")
-                print(f"{'-' * 80}")
-                # Stata: "Test of difference between AS and WAS"
-                title = "Test of difference between AS and WAS"
-                padding = (80 - len(title)) // 2
-                print(f"{' ' * padding}{title}")
-                print("H0: AS = WAS")
-                print(f"{'-' * 80}")
+                print(f"\n{'-' * 70}")
+                print(f"{' ' * 15}Difference test: AOSS and WAOSS")
+                print(f"{'-' * 70}")
+                print("H0: AOSS = WAOSS")
                 tab_print(diff_tab)
-
-        # Final closing line
-        print(f"{'-' * 80}")
 
     # First-stage results (IV-WAOSS)
     fs_obj = obj.get("first_stage", None)
     if fs_obj is not None:
         print(f"\n{'=' * 80}")
-        print(f"{' ' * 25}First stage estimation")
+        print(f"{' ' * 30}First stage estimation")
         print(f"{'=' * 80}")
         summary_did_multiplegt_stat(fs_obj)
         print(f"{'=' * 80}")
-        print(f"{' ' * 25}Reduced form estimation (above)")
+        print(f"{' ' * 30}Reduced form estimation (above)")
         print(f"{'=' * 80}")
 
-    # TWFE comparison - Stata format
+    # TWFE comparison
     twfe_tab = obj.get("twfe_comparison", None)
     if twfe_tab is not None:
-        print(f" ")
-        # Determine estimator label for title
-        if "ivwaoss" in estim_list:
-            title = "Test of difference between TWFE and IV-WAS"
-        elif "waoss" in estim_list:
-            title = "Test of difference between TWFE and WAS"
-        else:
-            title = "Test of difference between TWFE and AS"
-        padding = (80 - len(title)) // 2
-        print(f"{' ' * padding}{title}")
-        if "ivwaoss" in estim_list:
-            print("H0: TWFE = IV-WAS")
-        elif "waoss" in estim_list:
-            print("H0: TWFE = WAS")
-        else:
-            print("H0: TWFE = AS")
-        print(f"{'-' * 80}")
+        print(f"\n{'-' * 70}")
+        print(f"{' ' * 15}TWFE Comparison (Bootstrap)")
+        print(f"{'-' * 70}")
         tab_print(twfe_tab)
-        print(f"{'-' * 80}")
-        print("Values in Column Estimate. are means of bootstrap's point estimates.")
 
 
 def print_did_multiplegt_stat(obj: Dict[str, Any]):
