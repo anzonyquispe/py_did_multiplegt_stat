@@ -4,7 +4,7 @@
 cd "/Users/anzony.quisperojas/Documents/GitHub/py_did_multiplegt_stat/stat_python"
 
 local today : display %tdCY-N-D date(c(current_date), "DMY")
-log using "logfile_`today'.log", replace
+log using "logfile_2026-02-27.log", append
 
 cap prog drop did_multiplegt_stat
 qui do "did_multiplegt_stat.ado"
@@ -118,6 +118,71 @@ eststo clear
 glob nb_quantiles = 3
 eststo model_quant: did_multiplegt_stat lngca id year tau, or(1)  estimator(as was)   placebo(1) by_baseline($nb_quantiles)
 
+/******************************************************************************
+       IV. Trimming + Cross-fitting (Gazoline)
+******************************************************************************/
+
+// trimming + cross_fitting
+did_multiplegt_stat lngca id year tau, or(1) controls(lngpinc) estimator(as was) placebo(3) as_vs_was trimming(10) cross_fitting(2)
+did_multiplegt_stat lngca id year lngpinc tau, controls(lngpinc) or(1) estimator(iv-was) trimming(10) cross_fitting(2)
+
+
+/******************************************************************************
+       V. Wagepan Data — Exact Match
+******************************************************************************/
+
+bcuse wagepan, clear
+
+// binary treatment
+did_multiplegt_stat lwage nr year union, estimator(was) exact_match placebo(1)
+
+// discrete treatment
+set seed 12345
+gen dis_u = runiformint(1, 5) + union
+gen lwage2 = lwage + 3*dis_u
+did_multiplegt_stat lwage2 nr year dis_u, estimator(was as) exact_match placebo(1)
+
+// IV-WAS exact_match
+did_multiplegt_stat lwage2 nr year dis_u union, estimator(iv-was) exact_match placebo(1)
+
+// other_treatments
+gen othertreat  = (lwage > 1.5)
+gen othertreat2 = (lwage < 1) | (lwage > 2)
+did_multiplegt_stat lwage nr year union, estimator(was) placebo(1) other_treatments(othertreat othertreat2) exact_match
+
+
+/******************************************************************************
+       VI. Companion Paper — Gazoline with cross_fitting
+******************************************************************************/
+
+use "gazoline_did_multiplegt_stat.dta", clear
+
+// Reduced-form
+did_multiplegt_stat lngca id year tau, or(1) as_vs_was controls(lngpinc) cross_fitting(10)
+
+// First-stage
+did_multiplegt_stat lngpinc id year tau, or(1) as_vs_was controls(lngpinc) cross_fitting(10)
+
+// IV-WAS
+did_multiplegt_stat lngca id year lngpinc tau, or(1) controls(lngpinc) cross_fitting(10) bootstrap(10) seed(1)
+
+
+// Robust to dynamic effects up to one lag
+did_multiplegt_stat lngca id year tau, or(1) controls(lngpinc) estimator(was) cross_fitting(10) on_placebo_sample
+did_multiplegt_stat lngpinc id year tau, or(1) controls(lngpinc) estimator(was) cross_fitting(10) on_placebo_sample
+
+
+/******************************************************************************
+       VII. Gentzkow et al. (2011)
+******************************************************************************/
+
+use "gentzkowetal_didtextbook.dta", clear
+
+// Main
+did_multiplegt_stat prestout cnty90 year numdailies, placebo(1) exact_match
+
+// By baseline
+did_multiplegt_stat prestout cnty90 year numdailies, placebo(1) exact_match by_baseline(2)
+
 
 log close
-
