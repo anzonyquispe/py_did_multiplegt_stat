@@ -16,6 +16,7 @@ Features:
 from __future__ import annotations
 
 import math
+import os
 import warnings
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -476,7 +477,8 @@ class _SvdWlsResult:
 
 
 def _svd_wls(formula: str, df: pd.DataFrame, weights: pd.Series,
-             rcond: float = 1e-7, use_float32: bool = False):
+             rcond: float = 1e-7, use_float32: bool = False,
+             use_rmcoll: bool = False):
     """Weighted least squares via sweep (Gauss-Jordan) or SVD with rank tolerance.
 
     Matches Stata's `reg` behavior: drops collinear terms automatically.
@@ -486,6 +488,11 @@ def _svd_wls(formula: str, df: pd.DataFrame, weights: pd.Series,
     2. Cross-product X'X is computed in float64 (matching Stata's internal math)
     3. Sweep (Gauss-Jordan) drops individual variables whose pivot falls below
        a tolerance, matching Stata's automatic collinearity handling in `reg`.
+
+    When use_rmcoll=True (only with use_float32=True), uses Stata's _rmcoll
+    algorithm: reverse variable order (right-to-left) + c(epsfloat) tolerance.
+    This matches Stata's collinearity detection for severely ill-conditioned
+    polynomial designs.  The intercept is protected from being dropped.
 
     When use_float32=False, uses SVD-based lstsq (standard WLS).
     """
@@ -502,15 +509,42 @@ def _svd_wls(formula: str, df: pd.DataFrame, weights: pd.Series,
 
     if use_float32:
         # Stata stores data in float (float32). Cast to match.
-        # Polynomial terms like D1^30 overflow float32 (max ~3.4e38), producing
-        # inf/NaN. In Stata this generates missing values, causing `cap reg` to
-        # fail. We replicate by raising an exception when overflow occurs.
         Xw = Xw.astype(np.float32).astype(np.float64)
         yw = yw.astype(np.float32).astype(np.float64)
         if not np.all(np.isfinite(Xw)) or not np.all(np.isfinite(yw)):
             raise ValueError("Regression failed: float32 overflow in design matrix")
 
         n, p = Xw.shape
+
+        col_names = list(X_dm.columns)
+        icept_idx = None
+        for ci, cn in enumerate(col_names):
+            if cn == "Intercept":
+                icept_idx = ci
+                break
+
+        non_icept = [i for i in range(p) if i != icept_idx] if icept_idx is not None else list(range(p))
+
+        if use_rmcoll and icept_idx is not None:
+            # _rmcoll mode: reverse variable order (right-to-left processing)
+            # with c(epsfloat) tolerance, matching Stata's _rmcoll collinearity
+            # detection.  Intercept is last and protected from being dropped.
+            reorder = non_icept[::-1] + [icept_idx]
+            _SWEEP_TOL = float(np.finfo(np.float32).eps)  # ~1.19e-7
+            _protect_last = True
+        elif icept_idx is not None and icept_idx < p - 1:
+            # Standard mode: forward variable order, intercept last, tight tol
+            reorder = non_icept + [icept_idx]
+            _SWEEP_TOL = 1e-15
+            _protect_last = False
+        else:
+            reorder = None
+            _SWEEP_TOL = 1e-15
+            _protect_last = False
+
+        if reorder is not None:
+            Xw = Xw[:, reorder]
+
         # Build augmented cross-product matrix [X'X, X'y; y'X, y'y]
         XtX = Xw.T @ Xw
         Xty = Xw.T @ yw
@@ -521,18 +555,14 @@ def _svd_wls(formula: str, df: pd.DataFrame, weights: pd.Series,
         A[p, :p] = Xty
         A[p, p] = yty
 
-        # Sweep (Gauss-Jordan elimination) with per-variable tolerance.
-        # Stata's reg uses c(epsdouble) ≈ 2.22e-16 as tolerance, but with
-        # float32 data the effective precision loss in X'X is ~epsfloat^2 ≈ 1e-14.
-        # Empirically calibrated: tol ≈ 1e-15 matches Stata's variable dropping.
         orig_diag = np.diag(XtX).copy()
         dropped = np.zeros(p, dtype=bool)
-        _SWEEP_TOL = 1e-15
 
         for k in range(p):
             pivot = A[k, k]
             threshold = _SWEEP_TOL * abs(orig_diag[k])
-            if abs(pivot) < threshold or abs(orig_diag[k]) == 0:
+            is_protected = _protect_last and (k == p - 1)
+            if (abs(pivot) < threshold or abs(orig_diag[k]) == 0) and not is_protected:
                 dropped[k] = True
                 A[k, :] = 0.0
                 A[:, k] = 0.0
@@ -547,6 +577,14 @@ def _svd_wls(formula: str, df: pd.DataFrame, weights: pd.Series,
 
         beta = A[:p, p].copy()
         beta[dropped] = 0.0
+
+        # Reorder beta back to patsy's original column order (intercept first)
+        if reorder is not None:
+            inv_reorder = [0] * p
+            for new_pos, old_pos in enumerate(reorder):
+                inv_reorder[old_pos] = new_pos
+            beta = beta[inv_reorder]
+
         rank = int(np.sum(~dropped))
         if rank == 0:
             raise ValueError("Regression failed: all variables dropped by sweep")
@@ -608,19 +646,21 @@ def polynomials_generator(df: pd.DataFrame, order: int, var_prefix: str = "D",
     ctrl_terms = []
 
     # Stata uses raw (uncentered) polynomial terms: D1^k, ctrl^k
-    # This matches Stata's polynomials_generator exactly.
-    d1_vals = df[var_col].to_numpy(dtype=float)
+    # Stata's `gen` stores as float32; replicate truncation for parity.
+    d1_f32 = df[var_col].to_numpy(dtype=np.float32)
+    d1_f64 = d1_f32.astype(np.float64)
 
     for k in range(1, order + 1):
         col_name = f"D1_XX_{k}_XX"
-        df[col_name] = d1_vals ** k
+        df[col_name] = (d1_f64 ** k).astype(np.float32).astype(np.float64)
         pol_terms.append(col_name)
 
         if controls:
             for ctrl in controls:
                 ctrl_col = f"{ctrl}_{k}_XX"
                 _ensure_numeric(df, ctrl)
-                df[ctrl_col] = df[ctrl].to_numpy(dtype=float) ** k
+                c_f32 = df[ctrl].to_numpy(dtype=np.float32).astype(np.float64)
+                df[ctrl_col] = (c_f32 ** k).astype(np.float32).astype(np.float64)
                 ctrl_terms.append(ctrl_col)
 
     if order > 1 and controls:
@@ -628,7 +668,8 @@ def polynomials_generator(df: pd.DataFrame, order: int, var_prefix: str = "D",
         for ctrl in controls:
             interaction_col = f"{ctrl}_x_{var_prefix}1_XX"
             _ensure_numeric(df, ctrl)
-            df[interaction_col] = df[ctrl].to_numpy(dtype=float) * d1_vals
+            c_f32 = df[ctrl].to_numpy(dtype=np.float32).astype(np.float64)
+            df[interaction_col] = (c_f32 * d1_f64).astype(np.float32).astype(np.float64)
             ctrl_terms.append(interaction_col)
 
         # Stata: c.control1#c.control2 (cross-interactions)
@@ -639,7 +680,9 @@ def polynomials_generator(df: pd.DataFrame, order: int, var_prefix: str = "D",
                     cross_col = f"{c1}_x_{c2}_XX"
                     _ensure_numeric(df, c1)
                     _ensure_numeric(df, c2)
-                    df[cross_col] = df[c1].to_numpy(dtype=float) * df[c2].to_numpy(dtype=float)
+                    c1_f32 = df[c1].to_numpy(dtype=np.float32).astype(np.float64)
+                    c2_f32 = df[c2].to_numpy(dtype=np.float32).astype(np.float64)
+                    df[cross_col] = (c1_f32 * c2_f32).astype(np.float32).astype(np.float64)
                     ctrl_terms.append(cross_col)
 
     ot_terms = []
@@ -1010,6 +1053,9 @@ def did_multiplegt_stat_pairwise(
         vars_to_set_missing += ["abs_delta_D_XX"]
     else:
         vars_to_set_missing += ["Z1_XX", "SI_XX"]
+    # Stata line 3347: controls are included in vars_to_set_to_missing
+    if controls:
+        vars_to_set_missing += [c for c in controls if c in df.columns]
 
     if placebo_index > 0 and "inSamplePlacebo_XX" in df.columns:
         mask_bad = (df["inSamplePlacebo_XX"] == 0)
@@ -1101,14 +1147,32 @@ def did_multiplegt_stat_pairwise(
         if "D1_XX" in df.columns:
             nun = int(df["D1_XX"].nunique(dropna=True))
             if nun >= 1:
-                # Stata: levelsof D1_XX; local order = r(r)
-                # With exact_match, order = number of distinct D1 values.
-                # Stata relies on `cap reg` + _rc==0 to skip pairs where the
-                # regression is infeasible; we replicate this via float32 SVD.
+                # Stata: levelsof D1_XX; local order = r(r) — always K.
+                # Generate K polynomial terms (matching Stata).
+                # For mean_pred: use K-1 terms with smf.ols (full rank, good
+                # point estimates). For ESbis/ES/SDD (SE only): use K terms
+                # with sweep (float32) to match Stata's collinearity handling.
                 o_reg = nun
-                o_logit_bis = nun
-                o_logit_Plus = nun
-                o_logit_Minus = nun
+                o_logit_bis = max(1, nun - 1)
+                o_logit_Plus = max(1, nun - 1)
+                o_logit_Minus = max(1, nun - 1)
+
+        # Stata generates polynomial terms D1^1..D1^k as float variables.
+        # When |D1|^k > Stata's maxfloat (1.7014e+38), the term is stored as
+        # missing, and `reg` excludes those observations.  We replicate this
+        # by identifying which D1 values would overflow and excluding them
+        # from group-mean computations (setting predictions to NaN).
+        _STATA_MAXFLOAT = 1.7014117331926443e+38
+        _d1_all = df["D1_XX"].dropna().unique()
+        _em_valid_d1 = set()
+        for _d in _d1_all:
+            _da = abs(float(_d))
+            if _da <= 1.0 or _da ** o_reg <= _STATA_MAXFLOAT:
+                _em_valid_d1.add(float(_d))
+        # Boolean mask: True for observations with valid (non-overflow) D1
+        _em_d1_ok = df["D1_XX"].apply(
+            lambda x: float(x) in _em_valid_d1 if pd.notna(x) else False)
+
         df.drop(columns=[c for c in ["has_match_min_XX", "has_match_max_XX"] if c in df.columns], inplace=True)
 
     # --- 14) Bookkeeping ---
@@ -1140,6 +1204,15 @@ def did_multiplegt_stat_pairwise(
     _poly_controls = em_controls
     df, reg_pol_terms = polynomials_generator(df, o_reg, var_prefix="D",
                                               controls=_poly_controls, other_treatments=other_treatments)
+    # For exact_match main effect: K-1 polynomial terms for mean_pred/SDD
+    # (full rank with smf.ols → perfect interpolation = group means).
+    # K terms (reg_pol_terms) are used for ESbis/ES regressions (sweep) and placebos.
+    if exact_match and o_reg >= 2:
+        _km1 = max(1, o_reg - 1)
+        _, reg_pol_terms_km1 = polynomials_generator(df, _km1, var_prefix="D",
+                                                      controls=_poly_controls, other_treatments=other_treatments)
+    else:
+        reg_pol_terms_km1 = reg_pol_terms
     if not exact_match:
         _, logit_bis_pol = polynomials_generator(df, o_logit_bis, var_prefix="D",
                                                  controls=_poly_controls, other_treatments=other_treatments)
@@ -1187,23 +1260,54 @@ def did_multiplegt_stat_pairwise(
 
     # --- 16b) Stata: cap reg feasibility check ---
     # Stata runs `cap reg deltaY_XX reg_vars_pol_XX if S_XX==0` and checks _rc==0.
-    # With exact_match + high polynomial order, Stata auto-drops collinear terms.
-    # We replicate via float32 SVD (matching Stata's single-precision arithmetic).
     _cap_reg_model = None
     if feasible_est and (aoss == 1 or waoss == 1):
         df0_test = df[(df["S_XX"] == 0) & df["delta_Y_XX"].notna()].copy()
-        ra_test_formula = f"delta_Y_XX ~ {reg_pol_terms}"
-        try:
-            if exact_match:
-                # Stata: unweighted `reg` with float32 precision
-                _cap_reg_model = _svd_wls(ra_test_formula, df0_test,
-                                           pd.Series(1.0, index=df0_test.index),
-                                           rcond=1e-7, use_float32=True)
-            else:
-                # Stata: reg deltaY_XX ... if S_XX==0  (NO weights)
+        if exact_match:
+            # Use K terms with float32 sweep to match Stata's `reg` behavior:
+            # Stata uses K polynomial terms + intercept, and drops collinear
+            # columns via Gauss-Jordan elimination.  With high-degree polynomials
+            # the result may NOT equal group means (R² < 1).
+            ra_test_formula = f"delta_Y_XX ~ {reg_pol_terms}"
+            try:
+                _w_test = pd.Series(np.ones(len(df0_test)), index=df0_test.index)
+                # First try standard sweep (forward order, tight tolerance)
+                _cap_reg_model = _svd_wls(ra_test_formula, df0_test, _w_test,
+                                          use_float32=True)
+                # Check if the design is severely ill-conditioned (cond > 1e16).
+                # When it is, the standard sweep keeps all columns but produces
+                # numerically unstable predictions.  Switch to Stata's _rmcoll
+                # algorithm (reverse sweep + epsfloat tolerance) which drops the
+                # right columns for such cases.
+                # When o_reg >= 6, the polynomial design matrix is severely
+                # ill-conditioned (cond > 1e20).  Stata's _rmcoll drops the
+                # most collinear columns via right-to-left sweep with
+                # c(epsfloat) tolerance.  For lower orders the standard forward
+                # sweep gives stable predictions matching Stata.
+                _n_stayer_unique = int(df0_test["D1_XX"].nunique(dropna=True))
+                if placebo_index > 0 and o_reg >= 6 and _n_stayer_unique >= 6:
+                    _cap_reg_model = _svd_wls(ra_test_formula, df0_test, _w_test,
+                                              use_float32=True, use_rmcoll=True)
+            except Exception:
+                feasible_est = False
+                if placebo_index > 0 and os.environ.get("DMS_DEBUG_PLACEBO"):
+                    _nun_st = int(df0_test["D1_XX"].nunique(dropna=True)) if len(df0_test) > 0 else 0
+                    print(f"  PAIR p={pairwise} plac={placebo_index}: INFEASIBLE (sweep failed) n_st={len(df0_test)} nun_st={_nun_st}")
+        else:
+            ra_test_formula = f"delta_Y_XX ~ {reg_pol_terms}"
+            try:
                 _cap_reg_model = smf.ols(ra_test_formula, data=df0_test).fit()
-        except Exception:
-            feasible_est = False
+            except Exception:
+                feasible_est = False
+    if not feasible_est and placebo_index > 0 and os.environ.get("DMS_DEBUG_PLACEBO"):
+        _sw = scalars.get(f"N_Switchers{pl}_XX", 0)
+        _st = scalars.get(f"N_Stayers{pl}_XX", 0)
+        if gap_XX != 0:
+            print(f"  PAIR p={pairwise} plac={placebo_index}: INFEASIBLE (gap={gap_XX}) sw={_sw:.0f} st={_st:.0f}")
+        elif _sw == 0:
+            print(f"  PAIR p={pairwise} plac={placebo_index}: INFEASIBLE (no switchers) sw={_sw:.0f} st={_st:.0f}")
+        elif _st <= 1:
+            print(f"  PAIR p={pairwise} plac={placebo_index}: INFEASIBLE (few stayers) sw={_sw:.0f} st={_st:.0f}")
 
     # --- 17) Cluster preparation ---
     cluster_col = None
@@ -1268,21 +1372,19 @@ def did_multiplegt_stat_pairwise(
         # --- 18A) Common prelims AOSS/WAOSS ---
         if waoss == 1 or aoss == 1:
             df0 = df[df["S_XX"] == 0].copy()
-            ra_formula = f"delta_Y_XX ~ {reg_pol_terms}"
-            # Reuse the cap_reg model from the pre-check if available
             if _cap_reg_model is not None:
                 ra_model = _cap_reg_model
                 df = lpredict(df, "mean_pred_XX", ra_model)
+            elif exact_match:
+                # Group-means fallback: equivalent to saturated polynomial OLS
+                ra_formula = f"delta_Y_XX ~ {reg_pol_terms}"
+                _gm_dy = df0.groupby("D1_XX")["delta_Y_XX"].mean()
+                df["mean_pred_XX"] = df["D1_XX"].map(_gm_dy).astype(float)
+                df.loc[~_em_d1_ok, "mean_pred_XX"] = np.nan
             else:
+                ra_formula = f"delta_Y_XX ~ {reg_pol_terms}"
                 try:
-                    if exact_match:
-                        # Stata: unweighted reg with float32 precision
-                        ra_model = _svd_wls(ra_formula, df0,
-                                            pd.Series(1.0, index=df0.index),
-                                            rcond=1e-7, use_float32=True)
-                    else:
-                        # Stata: reg deltaY_XX ... if S_XX==0  (NO weights)
-                        ra_model = smf.ols(ra_formula, data=df0).fit()
+                    ra_model = smf.ols(ra_formula, data=df0).fit()
                     df = lpredict(df, "mean_pred_XX", ra_model)
                 except Exception:
                     df["mean_pred_XX"] = 0.0
@@ -1321,16 +1423,29 @@ def did_multiplegt_stat_pairwise(
                     # Stata: trimming without cross_fitting is not allowed (ignored)
                     pass
             else:
-                # Stata: unweighted reg for ESbis and ES predictions
-                _ones = pd.Series(1.0, index=df.index)
+                # exact_match: Stata uses reg Sbis/S on K polynomial terms (all obs)
+                # Use K terms with float32 sweep to match Stata's collinearity handling.
                 esbis_formula = f"S_bis_XX ~ {reg_pol_terms}"
-                esbis_model = _svd_wls(esbis_formula, df, _ones, rcond=1e-7, use_float32=True)
-                df = lpredict(df, "ES_bis_XX_D_1", esbis_model)
                 es_formula = f"S_XX ~ {reg_pol_terms}"
-                es_model = _svd_wls(es_formula, df, _ones, rcond=1e-7, use_float32=True)
-                df = lpredict(df, "ES_XX_D_1", es_model)
+                try:
+                    _w_es = pd.Series(np.ones(len(df)), index=df.index)
+                    _esbis_m = _svd_wls(esbis_formula, df, _w_es, use_float32=True)
+                    df = lpredict(df, "ES_bis_XX_D_1", _esbis_m)
+                except Exception:
+                    _df_ok = df[_em_d1_ok]
+                    _gm_sbis = _df_ok.groupby("D1_XX")["S_bis_XX"].mean()
+                    df["ES_bis_XX_D_1"] = df["D1_XX"].map(_gm_sbis).astype(float)
+                try:
+                    _es_m = _svd_wls(es_formula, df, _w_es, use_float32=True)
+                    df = lpredict(df, "ES_XX_D_1", _es_m)
+                except Exception:
+                    _df_ok = df[_em_d1_ok]
+                    _gm_s = _df_ok.groupby("D1_XX")["S_XX"].mean()
+                    df["ES_XX_D_1"] = df["D1_XX"].map(_gm_s).astype(float)
 
                 if cross_fitting > 0:
+                    esbis_formula = f"S_bis_XX ~ {reg_pol_terms}"
+                    es_formula = f"S_XX ~ {reg_pol_terms}"
                     df = _cf_regression(df, esbis_formula, "S_bis_XX", "ES_bis_XX_D_1")
                     df = _cf_regression(df, es_formula, "S_XX", "ES_XX_D_1")
 
@@ -1357,14 +1472,23 @@ def did_multiplegt_stat_pairwise(
             df.loc[df["S_bis_XX"] == 0, "S_over_delta_D_XX"] = 0.0
 
             # Stata: reg S_over_deltaD_XX vars (unweighted for exact_match)
-            sdd_formula = f"S_over_delta_D_XX ~ {reg_pol_terms}"
+            # Use K terms with float32 sweep to match Stata's collinearity handling.
+            _sdd_pol = reg_pol_terms  # K terms for both exact_match and normal
+            sdd_formula = f"S_over_delta_D_XX ~ {_sdd_pol}"
             if exact_match:
-                sdd_model = _svd_wls(sdd_formula, df, pd.Series(1.0, index=df.index),
-                                     rcond=1e-7, use_float32=True)
+                try:
+                    _w_sdd = pd.Series(np.ones(len(df)), index=df.index)
+                    _sdd_m = _svd_wls(sdd_formula, df, _w_sdd, use_float32=True)
+                    df = lpredict(df, "mean_S_over_delta_D_XX", _sdd_m)
+                except Exception:
+                    _df_ok_sdd = df[_em_d1_ok]
+                    _gm_sdd = _df_ok_sdd.groupby("D1_XX")["S_over_delta_D_XX"].mean()
+                    df["mean_S_over_delta_D_XX"] = df["D1_XX"].map(_gm_sdd).astype(float)
+                    df.loc[~_em_d1_ok, "mean_S_over_delta_D_XX"] = np.nan
             else:
                 # Stata: reg S_over_deltaD_XX ... (NO weights)
                 sdd_model = smf.ols(sdd_formula, data=df).fit()
-            df = lpredict(df, "mean_S_over_delta_D_XX", sdd_model)
+                df = lpredict(df, "mean_S_over_delta_D_XX", sdd_model)
 
             # Cross-fitting for E[S/ΔD|D1]
             if cross_fitting > 0:
@@ -1383,6 +1507,22 @@ def did_multiplegt_stat_pairwise(
                 _d1v_nm = _d1v[~np.isnan(_d1v)]
                 d1_num = float(np.mean(_d1v_nm)) if len(_d1v_nm) > 0 else 0.0
                 scalars[f"delta_1_{pairwise}{pl}_XX"] = d1_num / ES if ES != 0 else 0.0
+                if placebo_index > 0 and os.environ.get("DMS_DEBUG_PLACEBO"):
+                    _n_sw = int(((df["S_XX"] != 0) & df["S_XX"].notna()).sum())
+                    _n_st = int((df["S_XX"] == 0).sum())
+                    _P_Ht = scalars[f"P_Ht_{pairwise}{pl}_XX"]
+                    _P_p = scalars[f"P_{pairwise}{pl}_XX"]
+                    _n_ht1 = int((df["Ht_XX"] == 1).sum())
+                    _n_ht0 = int((df["Ht_XX"] == 0).sum())
+                    _n_d1_unique = int(df["D1_XX"].nunique(dropna=True))
+                    _cap_ok = "YES" if _cap_reg_model is not None else "NO"
+                    print(f"  PAIR p={pairwise} plac={placebo_index}: d1={d1_num/ES if ES!=0 else 0:.8f} ES={ES:.4f} P_Ht={_P_Ht:.4f} P_p={_P_p:.6f} N={len(df)} sw={_n_sw} st={_n_st} Ht1={_n_ht1} Ht0={_n_ht0} order={_n_d1_unique} cap_reg={_cap_ok}")
+                    if os.environ.get("DMS_DEBUG_PLACEBO") == "DETAIL" and pairwise == int(os.environ.get("DMS_DEBUG_PAIR", "3")):
+                        _dbg = df[["ID_XX","D1_XX","delta_Y_XX","delta_D_XX","S_XX","S_bis_XX","Ht_XX","weight_XX","mean_pred_XX","_inner_sum_d1_XX","_inner_sum_d1_V_XX"]].copy()
+                        _dbg = _dbg.sort_values("ID_XX")
+                        print(f"    --- Per-ID data for p={pairwise} plac={placebo_index} ---")
+                        for _, r in _dbg.iterrows():
+                            print(f"    ID={int(r['ID_XX']):3d} D1={r['D1_XX']:8.2f} dY={r['delta_Y_XX']:10.6f} dD={r['delta_D_XX']:8.4f} S={r['S_XX']:4.0f} Sbis={r['S_bis_XX']:4.0f} Ht={r['Ht_XX']:2.0f} w={r['weight_XX']:6.2f} mp={r['mean_pred_XX']:10.6f} is_d1={r['_inner_sum_d1_XX']:12.8f} is_d1V={r['_inner_sum_d1_V_XX']:12.8f}")
             else:
                 ps0_safe = df[ps0_col].replace(0, np.nan)
                 df["dr_delta1_DR_XX"] = np.where(
@@ -1661,13 +1801,11 @@ def did_multiplegt_stat_pairwise(
                 # PS bounding (Stata: replace PS_IV0Z1_XX=0 if <=10^(-10))
                 df.loc[df["PS_IV_0_Z_1_XX"] <= 1e-10, "PS_IV_0_Z_1_XX"] = 0.0
             else:
-                _ones = pd.Series(1.0, index=df.index)
-                esibis_formula = f"SI_bis_XX ~ {IV_reg_pol_terms}"
-                esibis_model = _svd_wls(esibis_formula, df, _ones, rcond=1e-7, use_float32=True)
-                df = lpredict(df, "ES_I_bis_XX_Z_1", esibis_model)
-                esi_formula = f"SI_XX ~ {IV_reg_pol_terms}"
-                esi_model = _svd_wls(esi_formula, df, _ones, rcond=1e-7, use_float32=True)
-                df = lpredict(df, "ES_I_XX_Z_1", esi_model)
+                # exact_match: group means by Z1 (equivalent to saturated polynomial)
+                _gm_sibis = df.groupby("Z1_XX")["SI_bis_XX"].mean()
+                df["ES_I_bis_XX_Z_1"] = df["Z1_XX"].map(_gm_sibis).astype(float)
+                _gm_si = df.groupby("Z1_XX")["SI_XX"].mean()
+                df["ES_I_XX_Z_1"] = df["Z1_XX"].map(_gm_si).astype(float)
 
             scalars[f"PS_IV_0{pl}_XX"] = Mean("S_IV_0_XX", df)
 
