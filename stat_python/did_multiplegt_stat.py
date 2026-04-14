@@ -1394,6 +1394,7 @@ def did_multiplegt_stat_pairwise(
             # Stata: SbisV_XX = Sbis_XX * weights_XX (used in Phi and ES)
             df["SbisV_XX"] = df["S_bis_XX"] * df["weight_XX"]
 
+            ra_formula = f"delta_Y_XX ~ {reg_pol_terms}"
             # Cross-fitting for E[ΔY|D1,S=0]
             if cross_fitting > 0:
                 df = _cf_regression(df, ra_formula, "delta_Y_XX", "mean_pred_XX",
@@ -1552,8 +1553,80 @@ def did_multiplegt_stat_pairwise(
                         cf_sum_w += cf_N_k
                         delta1_num += cf_N_k * cf_delta1_k
                     scalars[f"delta_1_{pairwise}{pl}_XX"] = delta1_num / cf_sum_w if cf_sum_w != 0 else 0.0
+                    if os.environ.get("DMS_DEBUG_CF"):
+                        _dr_ok = _dr[~np.isnan(_dr)]
+                        _meanDR = float(np.mean(_dr_ok)) if len(_dr_ok) > 0 else 0.0
+                        _Pt = scalars.get(f"P_{pairwise}{pl}_XX", 0.0)
+                        print(f"  [CF-AS] p={pairwise} plac={placebo_index}: delta1={delta1_num/cf_sum_w if cf_sum_w!=0 else 0:.10f} Pt={_Pt:.8f} sumw={cf_sum_w:.2f} N={len(df)} sw={int(df['S_bis_XX'].sum())}")
+                        # Ablation: compute delta1 with different nuisance param combos
+                        if os.environ.get("DMS_DEBUG_CF") in ("ABLATION", "DETAIL"):
+                            _fs_ps0 = df["PS_0_D_1_XX"].replace(0, np.nan).to_numpy(dtype=float)
+                            _fs_is = df["inner_sum_delta_1_2_XX"].to_numpy(dtype=float)
+                            _fs_sdd = df["mean_S_over_delta_D_XX"].to_numpy(dtype=float)
+                            _cf_ps0_v = df["cf_PS_0_D_1_XX"].replace(0, np.nan).to_numpy(dtype=float)
+                            _cf_is_v = df["cf_inner_sum_delta_1_2_XX"].to_numpy(dtype=float)
+                            _cf_sdd_v = df["cf_mean_S_over_delta_D_XX"].to_numpy(dtype=float)
+                            _sbis = df["S_bis_XX"].to_numpy(dtype=float)
+                            _sodd = df["S_over_delta_D_XX"].to_numpy(dtype=float)
+                            _combos = [
+                                ("all_CF   ", _cf_sdd_v, _cf_ps0_v, _cf_is_v),
+                                ("full_p   ", _cf_sdd_v, _fs_ps0, _cf_is_v),
+                                ("full_g   ", _fs_sdd, _cf_ps0_v, _cf_is_v),
+                                ("full_mu  ", _cf_sdd_v, _cf_ps0_v, _fs_is),
+                                ("full_p_g ", _fs_sdd, _fs_ps0, _cf_is_v),
+                                ("full_p_mu", _cf_sdd_v, _fs_ps0, _fs_is),
+                                ("full_g_mu", _fs_sdd, _cf_ps0_v, _fs_is),
+                                ("all_FULL ", _fs_sdd, _fs_ps0, _fs_is),
+                            ]
+                            for _cname, _csdd, _cps0, _cis in _combos:
+                                _drt = np.where(_sbis == 0, -(_csdd / _cps0) * _cis, _sodd * _cis)
+                                _drt = _drt.astype(float)
+                                _asw = 0.0; _asn = 0.0
+                                for cf_id in range(1, cross_fitting + 1):
+                                    fm = _cf == cf_id
+                                    fm_ok = fm & ~np.isnan(_drt)
+                                    _asbv = _sb[fm_ok] * _w[fm_ok]
+                                    _aNk = float(np.sum(_asbv))
+                                    _aESk = float(np.mean(_asbv)) if np.any(fm_ok) else 0.0
+                                    if _aESk == 0:
+                                        _adk = 0.0
+                                    else:
+                                        _adk = float(np.sum(_drt[fm_ok] * _w[fm_ok])) / _aNk
+                                    _asw += _aNk; _asn += _aNk * _adk
+                                _ad1 = _asn / _asw if _asw != 0 else 0.0
+                                print(f"    ABLATION p={pairwise} {_cname}: delta1={_ad1:.10f}")
+                        if os.environ.get("DMS_DEBUG_CF") == "DETAIL" and str(pairwise) == os.environ.get("DMS_DEBUG_PAIR", "3"):
+                            print(f"    --- Per-fold AS detail for pair {pairwise} ---")
+                            for cf_id in range(1, cross_fitting + 1):
+                                fm = _cf == cf_id
+                                fm_ok = fm & ~np.isnan(_dr)
+                                _n_fold = int(np.sum(fm))
+                                _n_ok = int(np.sum(fm_ok))
+                                _sbv = _sb[fm_ok] * _w[fm_ok]
+                                _nk = float(np.sum(_sbv))
+                                _esk = float(np.mean(_sbv)) if _n_ok > 0 else 0.0
+                                if _esk == 0:
+                                    _dk = 0.0
+                                    _numk = 0.0
+                                else:
+                                    _numk = float(np.sum(_dr[fm_ok] * _w[fm_ok]))
+                                    _dk = _numk / _nk
+                                print(f"      fold {cf_id}: N={_n_fold} ok={_n_ok} Nk={_nk:.1f} ESk={_esk:.4f} numk={_numk:.8f} dk={_dk:.10f}")
+                            # Also dump per-obs data
+                            print(f"    --- Per-obs data (first 20 obs) ---")
+                            _dbg_df = df[["ID_XX","D1_XX","S_bis_XX","cf_sample_id",
+                                          inner_sum_col, ps0_col, sdd_cf_col,
+                                          "inner_sum_delta_1_2_XX","PS_0_D_1_XX","mean_S_over_delta_D_XX",
+                                          "S_over_delta_D_XX","dr_delta1_DR_XX","weight_XX"]].head(20)
+                            for _, r in _dbg_df.iterrows():
+                                print(f"      ID={int(r['ID_XX']):3d} D1={r['D1_XX']:.4f} S={r['S_bis_XX']:.0f} fold={int(r['cf_sample_id'])} "
+                                      f"cf_is={r[inner_sum_col]:.8f} cf_ps0={r[ps0_col]:.8f} cf_sdd={r[sdd_cf_col]:.8f} "
+                                      f"fs_is={r['inner_sum_delta_1_2_XX']:.8f} fs_ps0={r['PS_0_D_1_XX']:.8f} fs_sdd={r['mean_S_over_delta_D_XX']:.8f} "
+                                      f"DR={r['dr_delta1_DR_XX']:.8f}")
                 else:
                     scalars[f"delta_1_{pairwise}{pl}_XX"] = Mean("dr_delta1_DR_XX", df)
+                    if os.environ.get("DMS_DEBUG_CF"):
+                        print(f"  [noCF-AS] p={pairwise} plac={placebo_index}: delta1={scalars[f'delta_1_{pairwise}{pl}_XX']:.10f} N={len(df)}")
 
             df["inner_sum_delta_1_XX"] = df["inner_sum_delta_1_2_XX"] / df["delta_D_XX"]
             df.loc[df["delta_D_XX"] == 0, "inner_sum_delta_1_XX"] = np.nan
@@ -1718,6 +1791,8 @@ def did_multiplegt_stat_pairwise(
                             cf_sum_w += denom_k
                             delta2_num += num_k
                     scalars[f"delta_2_{pairwise}{pl}_XX"] = delta2_num / cf_sum_w if cf_sum_w != 0 else 0.0
+                    if os.environ.get("DMS_DEBUG_CF"):
+                        print(f"  [CF-WAS] p={pairwise} plac={placebo_index}: delta2={delta2_num/cf_sum_w if cf_sum_w!=0 else 0:.10f} num={delta2_num:.8f} sumw={cf_sum_w:.2f}")
                 else:
                     sum_abs = Sum("abs_delta_D_XX", df)
                     scalars[f"delta_2_{pairwise}{pl}_XX"] = scalars[f"denom_dr_delta_2{pl}_XX"] / sum_abs if sum_abs != 0 else 0.0
