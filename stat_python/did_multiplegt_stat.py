@@ -435,10 +435,42 @@ def _expit(x: np.ndarray) -> np.ndarray:
     return out
 
 
+class _CustomLogitResult:
+    """Result wrapper for custom logit, compatible with lpredict()."""
+
+    def __init__(self, params: np.ndarray, col_names: list):
+        self.params = pd.Series(params, index=col_names)
+        self._params_array = params
+        self._col_names = col_names
+
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        n = len(df)
+        X_cols = []
+        for col_name in self._col_names:
+            if col_name == "Intercept":
+                X_cols.append(np.ones(n))
+            elif col_name in df.columns:
+                X_cols.append(df[col_name].to_numpy(dtype=float))
+            else:
+                X_cols.append(np.full(n, np.nan))
+        X = np.column_stack(X_cols)
+        xb = X @ self._params_array
+        return _expit(xb)
+
+
 def _is_binomial_glm(model) -> bool:
     try:
-        fam = getattr(getattr(model, "model", None), "family", None)
-        return isinstance(fam, sm.families.Binomial)
+        if isinstance(model, _CustomLogitResult):
+            return True
+        inner = getattr(model, "model", None)
+        if inner is None:
+            return False
+        fam = getattr(inner, "family", None)
+        if isinstance(fam, sm.families.Binomial):
+            return True
+        if isinstance(inner, sm.Logit):
+            return True
+        return False
     except Exception:
         return False
 
@@ -597,14 +629,75 @@ def _svd_wls(formula: str, df: pd.DataFrame, weights: pd.Series,
 
 
 def stata_logit(formula: str, df: pd.DataFrame, wcol: str = "weight_XX",
-                maxit: int = 300, tol: float = 1e-8):
-    # Stata (line 3708): logit S0_XX `logit_bis_pol_XX', asis — NO weights
-    # The logit for propensity scores is always unweighted in Stata.
-    model = smf.glm(formula=formula, data=df, family=sm.families.Binomial())
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        res = model.fit(maxiter=maxit, tol=tol, disp=0)
-    return res
+                maxit: int = 16000, nrtol: float = 1e-5):
+    """Logit matching Stata's ``logit ..., asis`` behaviour.
+
+    From-scratch Modified Newton-Raphson (no statsmodels dependency).
+    Convergence: nrtolerance g'(-H)^{-1}g < 1e-5 (Stata ml default).
+
+    - Starting values: slopes=0, constant=ln(p/(1-p))  (Stata default)
+    - nrtolerance:  g'(-H)^{-1}g < 1e-5               (Stata ml default)
+    - Max iterations: 16 000                             (Stata c(maxiter))
+    - Step halving with "back up" on failure.
+    """
+    import patsy
+    y_dm, X_dm = patsy.dmatrices(formula, data=df, return_type="dataframe")
+    y = y_dm.to_numpy(dtype=float).ravel()
+    X = X_dm.to_numpy(dtype=float)
+    col_names = list(X_dm.columns)
+    n, k = X.shape
+
+    # Stata starting values: slopes = 0, constant = ln(p/(1-p))
+    p_mean = np.clip(y.mean(), 1e-15, 1 - 1e-15)
+    params = np.zeros(k)
+    if "Intercept" in col_names:
+        params[col_names.index("Intercept")] = np.log(p_mean / (1 - p_mean))
+
+    for _it in range(maxit):
+        xb = X @ params
+        pr = _expit(xb)
+
+        # Gradient: X'(y - p)
+        g = X.T @ (y - pr)
+
+        # Hessian: -X' diag(p*(1-p)) X
+        w = pr * (1.0 - pr)
+        H = -(X.T * w) @ X
+
+        # Newton step: solve (-H) * step = g
+        try:
+            step = np.linalg.solve(-H, g)
+        except np.linalg.LinAlgError:
+            break
+        if not np.all(np.isfinite(step)):
+            break
+
+        # nrtolerance criterion: g'(-H)^{-1}g = g'step
+        nrc = float(np.dot(g, step))
+        if nrc < nrtol:
+            break
+
+        # Log-likelihood at current params
+        ll_old = float(np.sum(y * xb - np.logaddexp(0.0, xb)))
+
+        # Step halving: accept if LL does not decrease
+        alpha = 1.0
+        step_improved = False
+        for _ in range(20):
+            cand = params + alpha * step
+            if np.all(np.isfinite(cand)):
+                xb_cand = X @ cand
+                ll_new = float(np.sum(y * xb_cand - np.logaddexp(0.0, xb_cand)))
+                if np.isfinite(ll_new) and ll_new >= ll_old - 1e-10:
+                    step_improved = True
+                    break
+            alpha *= 0.5
+
+        if step_improved:
+            params = params + alpha * step
+        # else: "backed up" — stay at current params, try next iteration
+
+    return _CustomLogitResult(params, col_names)
 
 
 def lpredict(df: pd.DataFrame, outcol: str, fitted_model, prob: bool = False,
@@ -868,6 +961,7 @@ def did_multiplegt_stat_pairwise(
     order_logit_bis: Optional[int] = None,
     order_logit_Plus: Optional[int] = None,
     order_logit_Minus: Optional[int] = None,
+    cf_folds_file: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Pairwise DiD estimation between consecutive time periods."""
 
@@ -1243,12 +1337,32 @@ def did_multiplegt_stat_pairwise(
     df["S_bis_XX"] = np.where(df["S_XX"].isna(), np.nan, (df["S_XX"] != 0).astype(float))
 
     # --- Cross-fitting: create sample IDs ---
-    # Use Stata-compatible mt64s RNG so fold assignments match Stata exactly
     if cross_fitting > 0 and (waoss == 1 or aoss == 1):
-        _rng_stata = _StataMT64(1234)
-        df["rnd_sorter_XX"] = _rng_stata.rnormal_array(len(df))
-        df = df.sort_values(["D1_XX", "rnd_sorter_XX"]).reset_index(drop=True)
-        df["cf_sample_id"] = 1 + np.arange(len(df)) % cross_fitting
+        _cf_loaded = False
+        if cf_folds_file is not None:
+            # Load fold IDs from external file (exported by Stata .ado)
+            try:
+                _cf_df = pd.read_csv(cf_folds_file)
+                _est_type = "aswas"
+                _mask = (
+                    (_cf_df["pairwise"] == pairwise) &
+                    (_cf_df["placebo_index"] == placebo) &
+                    (_cf_df["estimator_type"] == _est_type)
+                )
+                _cf_sub = _cf_df.loc[_mask, ["ID_XX", "cf_sample_id"]].copy()
+                if len(_cf_sub) > 0:
+                    _cf_sub["ID_XX"] = _cf_sub["ID_XX"].astype(df["ID_XX"].dtype)
+                    _cf_sub["cf_sample_id"] = _cf_sub["cf_sample_id"].astype(int)
+                    df = df.merge(_cf_sub, on="ID_XX", how="left")
+                    _cf_loaded = True
+            except Exception as e:
+                warnings.warn(f"Could not load cf_folds_file: {e}. Falling back to internal RNG.")
+        if not _cf_loaded:
+            # Use Stata-compatible mt64s RNG so fold assignments match Stata exactly
+            _rng_stata = _StataMT64(1234)
+            df["rnd_sorter_XX"] = _rng_stata.rnormal_array(len(df))
+            df = df.sort_values(["D1_XX", "rnd_sorter_XX"]).reset_index(drop=True)
+            df["cf_sample_id"] = 1 + np.arange(len(df)) % cross_fitting
 
     # --- 16) Feasibility check ---
     if aoss == 1 or waoss == 1:
@@ -1345,9 +1459,18 @@ def did_multiplegt_stat_pairwise(
 
         # Helper for cross-fitted regression
         def _cf_regression(df_in, formula, dep_var, pred_col, subset_mask=None,
-                           use_logit=False, wcol="weight_XX"):
-            """Run cross-fitted regression: train leaving out each fold, predict on held-out."""
+                           use_logit=False, wcol="weight_XX", fallback_model=None):
+            """Run cross-fitted regression: train leaving out each fold, predict on held-out.
+
+            fallback_model: initial model to use when a fold's estimation fails.
+            Stata's ``capture logit`` + ``predict`` reuses the last stored e(b)
+            when the logit errors (e.g. "outcome does not vary").  Python's GLM
+            does not raise an exception for all-zero response — it converges to
+            extreme values.  To match Stata, we detect no-variation in the dep
+            var before fitting and fall back to the last successful model.
+            """
             df_in[f"cf_{pred_col}"] = np.nan
+            last_model = fallback_model  # Stata: e(b) starts as full-sample model
             for cf_id in range(1, cross_fitting + 1):
                 train_mask = df_in["cf_sample_id"] != cf_id
                 test_mask = df_in["cf_sample_id"] == cf_id
@@ -1356,6 +1479,19 @@ def did_multiplegt_stat_pairwise(
                 train = df_in[train_mask].copy()
                 test = df_in[test_mask].copy()
                 if len(train) < 2:
+                    if last_model is not None:
+                        test = lpredict(test, f"cf_{pred_col}", last_model, prob=use_logit)
+                        df_in.loc[test.index, f"cf_{pred_col}"] = test[f"cf_{pred_col}"]
+                    continue
+                # Stata: logit errors with "outcome does not vary" (r(2000))
+                # when the dep var is constant.  capture eats the error, predict
+                # reuses last e(b).  Python's GLM silently converges to extreme
+                # values instead of raising, so we must detect this explicitly.
+                _dep_vals = train[dep_var].dropna()
+                if use_logit and len(_dep_vals) > 0 and _dep_vals.nunique() <= 1:
+                    if last_model is not None:
+                        test = lpredict(test, f"cf_{pred_col}", last_model, prob=use_logit)
+                        df_in.loc[test.index, f"cf_{pred_col}"] = test[f"cf_{pred_col}"]
                     continue
                 try:
                     if use_logit:
@@ -1363,10 +1499,13 @@ def did_multiplegt_stat_pairwise(
                     else:
                         # Stata: reg ... (NO weights for polynomial regressions)
                         mod = smf.ols(formula, data=train).fit()
+                    last_model = mod
                     test = lpredict(test, f"cf_{pred_col}", mod, prob=use_logit)
                     df_in.loc[test.index, f"cf_{pred_col}"] = test[f"cf_{pred_col}"]
                 except Exception:
-                    pass
+                    if last_model is not None:
+                        test = lpredict(test, f"cf_{pred_col}", last_model, prob=use_logit)
+                        df_in.loc[test.index, f"cf_{pred_col}"] = test[f"cf_{pred_col}"]
             return df_in
 
         # --- 18A) Common prelims AOSS/WAOSS ---
@@ -1403,6 +1542,7 @@ def did_multiplegt_stat_pairwise(
 
             if not exact_match:
                 ps0_formula = f"S0_XX ~ {logit_bis_pol}"
+                ps0_model = None
                 try:
                     ps0_model = stata_logit(ps0_formula, df)
                     df = lpredict(df, "PS_0_D_1_XX", ps0_model, prob=True)
@@ -1414,7 +1554,8 @@ def did_multiplegt_stat_pairwise(
 
                 # Cross-fitting for P(S=0|D1)
                 if cross_fitting > 0:
-                    df = _cf_regression(df, ps0_formula, "S0_XX", "PS_0_D_1_XX", use_logit=True)
+                    df = _cf_regression(df, ps0_formula, "S0_XX", "PS_0_D_1_XX",
+                                        use_logit=True, fallback_model=ps0_model)
                     df.loc[df["cf_PS_0_D_1_XX"] <= 1e-10, "cf_PS_0_D_1_XX"] = 0.0
                     # Trimming on cross-fitted PS
                     if trimming > 0:
@@ -1723,6 +1864,7 @@ def did_multiplegt_stat_pairwise(
                         df[f"PS_1_{suffix}_D_1_XX"] = 0.0
                     else:
                         ps1_formula = f"Ster_XX ~ {logit_pol}"
+                        ps1_model = None
                         try:
                             ps1_model = stata_logit(ps1_formula, df)
                             df = lpredict(df, f"PS_1_{suffix}_D_1_XX", ps1_model, prob=True)
@@ -1731,7 +1873,10 @@ def did_multiplegt_stat_pairwise(
 
                         # Cross-fitting for P(S+/S-|D1)
                         if cross_fitting > 0:
-                            df = _cf_regression(df, ps1_formula, "Ster_XX", f"PS_1_{suffix}_D_1_XX", use_logit=True)
+                            # Pass full-sample model as fallback: Stata's capture+predict
+                            # reuses last e(b) when logit fails ("outcome does not vary").
+                            df = _cf_regression(df, ps1_formula, "Ster_XX", f"PS_1_{suffix}_D_1_XX",
+                                                use_logit=True, fallback_model=ps1_model)
 
                         if estimation_method == "ps":
                             df[f"delta_Y_P_{suffix}_XX"] = (
@@ -1793,6 +1938,44 @@ def did_multiplegt_stat_pairwise(
                     scalars[f"delta_2_{pairwise}{pl}_XX"] = delta2_num / cf_sum_w if cf_sum_w != 0 else 0.0
                     if os.environ.get("DMS_DEBUG_CF"):
                         print(f"  [CF-WAS] p={pairwise} plac={placebo_index}: delta2={delta2_num/cf_sum_w if cf_sum_w!=0 else 0:.10f} num={delta2_num:.8f} sumw={cf_sum_w:.2f}")
+                        if os.environ.get("DMS_DEBUG_CF") in ("ABLATION", "DETAIL"):
+                            _sbis = df["S_bis_XX"].to_numpy(dtype=float)
+                            _sxx = df["S_XX"].to_numpy(dtype=float)
+                            _fs_ps_plus = df.get("PS_1_Plus_D_1_XX", pd.Series(0.0, index=df.index)).to_numpy(dtype=float)
+                            _fs_ps_minus = df.get("PS_1_Minus_D_1_XX", pd.Series(0.0, index=df.index)).to_numpy(dtype=float)
+                            _fs_ps0 = df["PS_0_D_1_XX"].to_numpy(dtype=float)
+                            _fs_ps0[_fs_ps0 == 0] = np.nan
+                            _fs_inner = df["inner_sum_delta_1_2_XX"].to_numpy(dtype=float)
+                            _cf_ps_plus = df.get("cf_PS_1_Plus_D_1_XX", pd.Series(0.0, index=df.index)).to_numpy(dtype=float)
+                            _cf_ps_minus = df.get("cf_PS_1_Minus_D_1_XX", pd.Series(0.0, index=df.index)).to_numpy(dtype=float)
+                            _cf_ps0 = df["cf_PS_0_D_1_XX"].to_numpy(dtype=float)
+                            _cf_ps0[_cf_ps0 == 0] = np.nan
+                            _cf_inner = df["cf_inner_sum_delta_1_2_XX"].to_numpy(dtype=float)
+                            _combos_was = [
+                                ("all_CF    ", _cf_ps_plus, _cf_ps_minus, _cf_ps0, _cf_inner),
+                                ("full_PS1  ", _fs_ps_plus, _fs_ps_minus, _cf_ps0, _cf_inner),
+                                ("full_PS0  ", _cf_ps_plus, _cf_ps_minus, _fs_ps0, _cf_inner),
+                                ("full_inner", _cf_ps_plus, _cf_ps_minus, _cf_ps0, _fs_inner),
+                                ("full_PS   ", _fs_ps_plus, _fs_ps_minus, _fs_ps0, _cf_inner),
+                                ("full_PS+in", _fs_ps_plus, _fs_ps_minus, _fs_ps0, _fs_inner),
+                                ("full_P0+in", _cf_ps_plus, _cf_ps_minus, _fs_ps0, _fs_inner),
+                                ("all_FULL  ", _fs_ps_plus, _fs_ps_minus, _fs_ps0, _fs_inner),
+                            ]
+                            for _cname, _cpp, _cpm, _cp0, _cin in _combos_was:
+                                _drt_st = -((_cpp - _cpm) / _cp0) * _cin
+                                _drt_sw = _sxx * _cin
+                                _drt = np.where(_sbis == 0, _drt_st, _drt_sw)
+                                _drt = np.where(np.isnan(_sbis), np.nan, _drt)
+                                _asw2 = 0.0; _asn2 = 0.0
+                                for cf_id in range(1, cross_fitting + 1):
+                                    fm = _cf == cf_id
+                                    fm_ok = fm & ~np.isnan(_drt)
+                                    _ank = float(np.sum(_a[fm_ok] * _w[fm_ok])) if np.any(fm_ok) else 0.0
+                                    _annk = float(np.sum(_drt[fm_ok] * _w[fm_ok])) if np.any(fm_ok) else 0.0
+                                    if _ank != 0:
+                                        _asw2 += _ank; _asn2 += _annk
+                                _ad2 = _asn2 / _asw2 if _asw2 != 0 else 0.0
+                                print(f"    ABLATION-WAS p={pairwise} {_cname}: delta2={_ad2:.10f}")
                 else:
                     sum_abs = Sum("abs_delta_D_XX", df)
                     scalars[f"delta_2_{pairwise}{pl}_XX"] = scalars[f"denom_dr_delta_2{pl}_XX"] / sum_abs if sum_abs != 0 else 0.0
@@ -2091,6 +2274,7 @@ def did_multiplegt_stat_main(
     twfe: bool = False,
     seed: int = 0,
     cross_validation_opt: Optional[Dict[str, Any]] = None,
+    cf_folds_file: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Main aggregation function."""
 
@@ -2285,6 +2469,7 @@ def did_multiplegt_stat_main(
         trimming=trimming, on_placebo_sample=on_placebo_sample,
         order_reg=order_reg, order_logit_bis=order_logit_bis,
         order_logit_Plus=order_logit_Plus, order_logit_Minus=order_logit_Minus,
+        cf_folds_file=cf_folds_file,
     )
 
     # --- MAIN EFFECTS LOOP ---
@@ -2742,6 +2927,7 @@ def did_multiplegt_stat(
     seed: int = 0,
     cross_validation: Optional[Dict[str, Any]] = None,
     iv_method: str = "manual",
+    cf_folds_file: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Python interface for did_multiplegt_stat.
@@ -2764,6 +2950,9 @@ def did_multiplegt_stat(
     twfe : bool or dict - Compare with TWFE regression. Dict keys: same_sample, percentile.
     cross_validation : dict - CV options (algorithm, tolerance, max_k, seed, kfolds).
     by_baseline : int - Number of quantile bins for baseline treatment.
+    cf_folds_file : str, optional - Path to CSV with cross-fitting fold IDs exported by Stata.
+        Columns: pairwise, placebo_index, estimator_type, ID_XX, cf_sample_id.
+        When provided, fold assignments are read from this file instead of generated internally.
     """
     if switchers is not None and switchers not in ("up", "down"):
         raise ValueError("Switchers must be None, 'up' or 'down'.")
@@ -2950,6 +3139,7 @@ def did_multiplegt_stat(
             trimming=trimming,
             on_placebo_sample=on_placebo_sample,
             cross_validation=cross_validation,
+            cf_folds_file=cf_folds_file,
         )
         out["first_stage"] = fs_result
         print("=" * 80)
@@ -2971,6 +3161,7 @@ def did_multiplegt_stat(
             order_logit_Plus=order_logit_Plus, order_logit_Minus=order_logit_Minus,
             bootstrap=bootstrap, twfe=twfe_active, seed=seed,
             cross_validation_opt=cross_validation,
+            cf_folds_file=cf_folds_file,
         )
 
     if mode == "_no_by":

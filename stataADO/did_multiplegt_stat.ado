@@ -12,7 +12,7 @@
 capture program drop did_multiplegt_stat
 program did_multiplegt_stat, eclass sortpreserve byable(recall)
 	version 12.0
-	syntax varlist(min=4 max=5 numeric) [if] [in] [, estimator(string) estimation_method(string) ORder(string) NOEXTRApolation placebo(integer 0) switchers(string) DISAGgregate as_vs_was exact_match bys_graph_off by_fd(integer 1) by_baseline(integer 1) other_treatments(varlist numeric) cluster(varlist max=1) controls(varlist numeric) weights(varlist numeric max=1)  bootstrap(integer 0) seed(integer 0) twfe(string) cross_validation(string) cross_fitting(integer 0) graph_off trimming(integer 0) on_placebo_sample] 
+	syntax varlist(min=4 max=5 numeric) [if] [in] [, estimator(string) estimation_method(string) ORder(string) NOEXTRApolation placebo(integer 0) switchers(string) DISAGgregate as_vs_was exact_match bys_graph_off by_fd(integer 1) by_baseline(integer 1) other_treatments(varlist numeric) cluster(varlist max=1) controls(varlist numeric) weights(varlist numeric max=1)  bootstrap(integer 0) seed(integer 0) twfe(string) cross_validation(string) cross_fitting(integer 0) graph_off trimming(integer 0) on_placebo_sample export_cf_folds(string)]
 
 	marksample touse 
 	if _by() {
@@ -119,7 +119,7 @@ if "`estimator'"!="iv-was"{
 		if ("`if'"!="") local if_touse = "`if'&`touse' == 1"
 		else local if_touse = "if `touse' == 1"
 		
-		did_multiplegt_stat2 `first_stage_specification'  `if_touse',  estimator(`estimator') estimation_method(`estimation_method') order(`first_stage_orders') `noextrapolation' placebo(`placebo') switchers(`switchers') `disagregate' `as_vs_was' `exact_match' `bys_graph_off' by_fd(`by_fd') by_baseline(`by_baseline') other_treatments(`other_treatments') cluster(`cluster') controls(`controls') weights(`weights') cross_validation(`cross_validation') `graph_off' `disaggregate' first_stage  cross_fitting(`cross_fitting') trimming(`trimming')
+		did_multiplegt_stat2 `first_stage_specification'  `if_touse',  estimator(`estimator') estimation_method(`estimation_method') order(`first_stage_orders') `noextrapolation' placebo(`placebo') switchers(`switchers') `disagregate' `as_vs_was' `exact_match' `bys_graph_off' by_fd(`by_fd') by_baseline(`by_baseline') other_treatments(`other_treatments') cluster(`cluster') controls(`controls') weights(`weights') cross_validation(`cross_validation') `graph_off' `disaggregate' first_stage  cross_fitting(`cross_fitting') trimming(`trimming') export_cf_folds(`export_cf_folds')
 }
 
 
@@ -159,7 +159,7 @@ end
 capture program drop did_multiplegt_stat2
 program did_multiplegt_stat2, eclass sortpreserve byable(recall)
 	version 12.0
-	syntax varlist(min=4 max=5 numeric) [if] [in] [, estimator(string) estimation_method(string) ORder(string) NOEXTRApolation placebo(integer 0) switchers(string) DISAGgregate as_vs_was exact_match bys_graph_off by_fd(integer 1) by_baseline(integer 1) other_treatments(varlist numeric) cluster(varlist max=1) controls(varlist numeric) weights(varlist numeric max=1)  bootstrap(integer 0) seed(integer 0) twfe(string) cross_validation(string) graph_off FIRST_stage reduced_form_orders(string) cross_fitting(integer 0)  trimming(integer 0) on_placebo_sample ] // FIRST_stage   twfe(percentile same_sample)
+	syntax varlist(min=4 max=5 numeric) [if] [in] [, estimator(string) estimation_method(string) ORder(string) NOEXTRApolation placebo(integer 0) switchers(string) DISAGgregate as_vs_was exact_match bys_graph_off by_fd(integer 1) by_baseline(integer 1) other_treatments(varlist numeric) cluster(varlist max=1) controls(varlist numeric) weights(varlist numeric max=1)  bootstrap(integer 0) seed(integer 0) twfe(string) cross_validation(string) graph_off FIRST_stage reduced_form_orders(string) cross_fitting(integer 0)  trimming(integer 0) on_placebo_sample export_cf_folds(string)] // FIRST_stage   twfe(percentile same_sample)
 
 	if ("`reduced_form_orders'"!="") {
 		local order = "`reduced_form_orders'"
@@ -177,7 +177,12 @@ program did_multiplegt_stat2, eclass sortpreserve byable(recall)
 	
 	//>MAIN: Preserve the inputted dataset
 	preserve
-	
+
+	// Delete existing export_cf_folds file so we start fresh
+	if ("`export_cf_folds'" != "") {
+		cap erase "`export_cf_folds'"
+	}
+
 	//If the user specify twfe without setting the bootstrap, take 100 as default.
 	//And store all the suboptions of twfe: percentile, same_sample (default are normal and maybe different samples.)
 	if ("`twfe'"!=""){
@@ -1041,7 +1046,7 @@ else{
 forvalues p = 2/`=max_T'{
 	
 	//i) Calling the command for each pair of time periods
-	did_multiplegt_stat_pairwise Y_XX ID_XX T_XX D_XX `IV_var_XX' `if' `in' , estimator(`estimator') or(`order') `noextrapolation' weights(weights_XX) switchers(`switchers') pairwise(`p') data_1XX($data_1XX) as(`as_XX') was(`was_XX') iwas(`iwas_XX') estimation_method(`estimation_method') `exact_match' cluster(`cluster') quantile(`q') by_fd(`by_fd') by_baseline(`by_baseline') other_treatments(`other_treatments') controls(`controls') reg_order(`reg_order') logit_bis_order(`logit_bis_order')  logit_Plus_order(`logit_Plus_order') logit_Minus_order(`logit_Minus_order') cross_validation(`cross_validation') cross_fitting(`cross_fitting')  trimming(`trimming') `on_placebo_sample'
+	did_multiplegt_stat_pairwise Y_XX ID_XX T_XX D_XX `IV_var_XX' `if' `in' , estimator(`estimator') or(`order') `noextrapolation' weights(weights_XX) switchers(`switchers') pairwise(`p') data_1XX($data_1XX) as(`as_XX') was(`was_XX') iwas(`iwas_XX') estimation_method(`estimation_method') `exact_match' cluster(`cluster') quantile(`q') by_fd(`by_fd') by_baseline(`by_baseline') other_treatments(`other_treatments') controls(`controls') reg_order(`reg_order') logit_bis_order(`logit_bis_order')  logit_Plus_order(`logit_Plus_order') logit_Minus_order(`logit_Minus_order') cross_validation(`cross_validation') cross_fitting(`cross_fitting')  trimming(`trimming') `on_placebo_sample' export_cf_folds(`export_cf_folds')
 
 	//i) Aggregation as the loop goes
 	
@@ -1333,7 +1338,7 @@ use "`OG_dataPathq'.dta", clear
 	forvalues p = `=2+`placebo_index''/`=max_T'{
 	
 	//i) Calling the command for each pair of time periods
-	did_multiplegt_stat_pairwise Y_XX ID_XX T_XX D_XX `IV_var_XX' `if' `in' , estimator(`estimator') or(`order') `noextrapolation' weights(weights_XX) switchers(`switchers') pairwise(`p') data_1XX(${data_1plaXX}) as(`as_XX') was(`was_XX') iwas(`iwas_XX') estimation_method(`estimation_method') placebo(`placebo_index') `exact_match' cluster(`cluster')  quantile(`q') by_fd(`by_fd') by_baseline(`by_baseline') other_treatments(`other_treatments') controls(`controls') reg_order(`reg_order') logit_bis_order(`logit_bis_order')  logit_Plus_order(`logit_Plus_order') logit_Minus_order(`logit_Minus_order') cross_validation(`cross_validation') cross_fitting(`cross_fitting')  trimming(`trimming') 
+	did_multiplegt_stat_pairwise Y_XX ID_XX T_XX D_XX `IV_var_XX' `if' `in' , estimator(`estimator') or(`order') `noextrapolation' weights(weights_XX) switchers(`switchers') pairwise(`p') data_1XX(${data_1plaXX}) as(`as_XX') was(`was_XX') iwas(`iwas_XX') estimation_method(`estimation_method') placebo(`placebo_index') `exact_match' cluster(`cluster')  quantile(`q') by_fd(`by_fd') by_baseline(`by_baseline') other_treatments(`other_treatments') controls(`controls') reg_order(`reg_order') logit_bis_order(`logit_bis_order')  logit_Plus_order(`logit_Plus_order') logit_Minus_order(`logit_Minus_order') cross_validation(`cross_validation') cross_fitting(`cross_fitting')  trimming(`trimming') export_cf_folds(`export_cf_folds')
 
 	//i) Aggregation as the loop goes
 	
@@ -3041,7 +3046,7 @@ end
 capture program drop did_multiplegt_stat_pairwise
 program did_multiplegt_stat_pairwise, eclass
 	version 12.0
-	syntax varlist(min=4 max=5 numeric) [if] [in] [, estimator(string) ORder(string) NOEXTRApolation weights(varlist numeric) switchers(string) pairwise(integer 2) data_1XX(string) as(integer 0) was(integer 0) iwas(integer 0) estimation_method(string) placebo(integer 0) exact_match cluster(varlist max=1) quantile(integer 1) by_fd(integer 1) by_baseline(integer 1) other_treatments(varlist numeric) controls(varlist numeric)  bootstrap(integer 0) reg_order(integer 1) logit_bis_order(integer 1)  logit_Plus_order(integer 1) logit_Minus_order(integer 1) cross_validation(string) cross_fitting(integer 0) trimming(integer 0) on_placebo_sample]
+	syntax varlist(min=4 max=5 numeric) [if] [in] [, estimator(string) ORder(string) NOEXTRApolation weights(varlist numeric) switchers(string) pairwise(integer 2) data_1XX(string) as(integer 0) was(integer 0) iwas(integer 0) estimation_method(string) placebo(integer 0) exact_match cluster(varlist max=1) quantile(integer 1) by_fd(integer 1) by_baseline(integer 1) other_treatments(varlist numeric) controls(varlist numeric)  bootstrap(integer 0) reg_order(integer 1) logit_bis_order(integer 1)  logit_Plus_order(integer 1) logit_Minus_order(integer 1) cross_validation(string) cross_fitting(integer 0) trimming(integer 0) on_placebo_sample export_cf_folds(string)]
 	
 quietly{
 //> CORE preserve
@@ -3617,9 +3622,26 @@ if (`was' == 1 | `as' == 1 ){
 	sort D1_XX rnd_sorter_XX
 	*Generate a new variable equal to 1 if the order is odd, 2 if even
 	gen cf_sample_id = 1 + mod(_n, `cross_fitting')
+
+	// Export cf_sample_id to CSV if requested
+	if ("`export_cf_folds'" != "") {
+		cap confirm file "`export_cf_folds'"
+		local cf_needs_header = (_rc != 0)
+		file open cfh using "`export_cf_folds'", write append
+		if (`cf_needs_header') {
+			file write cfh "pairwise,placebo_index,estimator_type,ID_XX,cf_sample_id" _n
+		}
+		local cf_N = _N
+		forvalues cf_i = 1/`cf_N' {
+			local cf_id = ID_XX[`cf_i']
+			local cf_fold = cf_sample_id[`cf_i']
+			file write cfh "`pairwise',`placebo',aswas,`cf_id',`cf_fold'" _n
+		}
+		file close cfh
 	}
-	
-	
+	}
+
+
 /*******************************************************************
 	Call polynomials_generator here: Start
 	*******************************************************************/
@@ -4247,8 +4269,25 @@ gen absdeltaZV_XX = absdeltaZ_XX*weights_XX
 	sort Z1_XX rnd_sorter_XX
 	*Generate a new variable equal to 1 if the order is odd, 2 if even
 	gen cf_sample_id = 1 + mod(_n, `cross_fitting')
+
+	// Export cf_sample_id to CSV if requested
+	if ("`export_cf_folds'" != "") {
+		cap confirm file "`export_cf_folds'"
+		local cf_needs_header = (_rc != 0)
+		file open cfh using "`export_cf_folds'", write append
+		if (`cf_needs_header') {
+			file write cfh "pairwise,placebo_index,estimator_type,ID_XX,cf_sample_id" _n
+		}
+		local cf_N = _N
+		forvalues cf_i = 1/`cf_N' {
+			local cf_id = ID_XX[`cf_i']
+			local cf_fold = cf_sample_id[`cf_i']
+			file write cfh "`pairwise',`placebo',iwas,`cf_id',`cf_fold'" _n
+		}
+		file close cfh
 	}
-	
+	}
+
 if (scalar(gap_`pairwise'`pla'XX)==0&scalar(n_switchersIV_`pla'XX)>0&scalar(n_stayersIV_`pla'XX)>10){ //Start of IV feasible estimation
 ************************************************
 
