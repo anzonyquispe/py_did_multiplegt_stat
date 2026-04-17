@@ -1,0 +1,79 @@
+-----------------------------------------------------------------------------------------------------------------
+      name:  <unnamed>
+       log:  C:\Users\Usuario\Documents\GitHub\py_did_multiplegt_stat\stat_python\cf_fold_export.log
+  log type:  text
+ opened on:  16 Apr 2026, 09:19:32
+
+. 
+. cap prog drop did_multiplegt_stat
+
+. cap prog drop did_multiplegt_stat2
+
+. cap prog drop did_multiplegt_stat_pairwise
+
+. qui do "..\stataADO\did_multiplegt_stat.ado"
+
+. 
+. use "gazoline_did_multiplegt_stat.dta", clear
+
+. 
+. // V.01 with cross_fitting(10) + fold export
+. di "================================================================"
+================================================================
+
+. di "--- V.01: cross_fitting(10) + export_cf_folds ---"
+--- V.01: cross_fitting(10) + export_cf_folds ---
+
+. di "================================================================"
+================================================================
+
+. did_multiplegt_stat lngca id year tau, or(1) as_vs_was controls(lngpinc) cross_fitting(10) export_cf_folds(cf_f
+> olds.csv)
+                                  ----------------------------------------------
+                                   Number of observations     =             1632
+                                   Estimation method          =    doubly-robust
+                                   Polynomial order           =              (1)
+                                  ----------------------------------------------
+--------------------------------------------------------------------------------
+                               Average Slope (AS)
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+          AS | -.0043121   .0027406  -.0096836   .0010594        384       1248 
+--------------------------------------------------------------------------------
+                           Weighted Average Slope (WAS)
+--------------------------------------------------------------------------------
+
+             |  Estimate         SE      LB CI      UB CI  Switchers    Stayers 
+-------------+------------------------------------------------------------------
+         WAS | -.0035981    .001019  -.0055954  -.0016008        384       1248 
+ 
+--------------------------------------------------------------------------------
+ 
+                          Test of difference between AS and WAS
+H0: AS = WAS
+--------------------------------------------------------------------------------
+
+             |     Diff.         SE      LB CI      UB CI      pval.          t 
+-------------+------------------------------------------------------------------
+      AS-WAS | -.0007141   .0156983  -.0051552    .003727   .7526526  -.3151437 
+--------------------------------------------------------------------------------
+
+. 
+. di ""
+
+
+. di "Fold IDs exported to cf_folds.csv"
+Fold IDs exported to cf_folds.csv
+
+. di "Now run Python with cf_folds_file='cf_folds.csv' to compare."
+Now run Python with cf_folds_file='cf_folds.csv' to compare.
+
+. 
+. log close
+      name:  <unnamed>
+       log:  C:\Users\Usuario\Documents\GitHub\py_did_multiplegt_stat\stat_python\cf_fold_export.log
+  log type:  text
+ closed on:  16 Apr 2026, 09:19:54
+-----------------------------------------------------------------------------------------------------------------
