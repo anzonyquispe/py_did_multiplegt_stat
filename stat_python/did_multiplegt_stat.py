@@ -727,9 +727,9 @@ def lpredict(df: pd.DataFrame, outcol: str, fitted_model, prob: bool = False,
 #   model.fit(formula, df, wcol=...)  -> returns self
 #   model.predict(df)                 -> returns predictions (probabilities for logit)
 #
-# Stata wrappers (stata_type=True) reproduce the existing Stata-faithful
+# Stata wrappers (asinstata=True) reproduce the existing Stata-faithful
 # behaviour (smf.ols, custom Newton-Raphson logit, smf.glm for CV).
-# Sklearn wrappers (stata_type=False) parse the patsy formula and forward to
+# Sklearn wrappers (asinstata=False) parse the patsy formula and forward to
 # scikit-learn's LinearRegression / LogisticRegression.  The wrappers expose a
 # `.predict(df)` that builds the design matrix from a DataFrame so they remain
 # drop-in compatible with `lpredict()`.  Logit wrappers set `is_logit=True`,
@@ -878,19 +878,68 @@ class _SklearnLogitModel:
         return proba
 
 
-def _make_ols(stata_type: bool = True):
+class _CustomModelWrapper:
+    """Wraps a user-provided sklearn-style model into the formula-based interface.
+
+    The wrapped model must implement:
+      - .fit(X, y)          — train on numpy arrays
+      - .predict(X)         — predict (regression) or predict_proba(X) (classification)
+
+    For classifiers, set ``is_classifier=True`` so that ``.predict()`` returns
+    P(y=1) via ``predict_proba`` (falling back to ``.predict()`` otherwise).
+
+    Each ``.fit()`` call clones the template via ``copy.deepcopy`` so the
+    original object is never mutated.
+    """
+
+    def __init__(self, model_template, is_classifier: bool = False):
+        self._template = model_template
+        self._is_classifier = is_classifier
+        self.is_logit = is_classifier
+
+    def fit(self, formula: str, df: pd.DataFrame, wcol: Optional[str] = None):
+        import copy
+        self._model = copy.deepcopy(self._template)
+        y, X, col_names, has_int, cols_no_int = _patsy_design(formula, df)
+        self._cols_no_int = cols_no_int
+        self._has_intercept = has_int
+        if self._is_classifier:
+            y = y.astype(int)
+        self._model.fit(X, y)
+        return self
+
+    def predict(self, df: pd.DataFrame):
+        X = _build_X_for_predict(df, self._cols_no_int)
+        nan_rows = (np.isnan(X).any(axis=1) if X.shape[1] > 0
+                    else np.zeros(len(df), dtype=bool))
+        X_safe = np.where(np.isnan(X), 0.0, X)
+        if self._is_classifier and hasattr(self._model, "predict_proba"):
+            pred = self._model.predict_proba(X_safe)[:, 1]
+        else:
+            pred = np.asarray(self._model.predict(X_safe), dtype=float)
+        pred = np.where(nan_rows, np.nan, pred)
+        return pred
+
+
+def _make_ols(asinstata: bool = True, custom_model=None):
     """Factory: OLS regression wrapper."""
-    return _StataOLSModel() if stata_type else _SklearnOLSModel()
+    if custom_model is not None:
+        return _CustomModelWrapper(custom_model, is_classifier=False)
+    return _StataOLSModel() if asinstata else _SklearnOLSModel()
 
 
-def _make_logit(stata_type: bool = True):
+def _make_logit(asinstata: bool = True, custom_model=None):
     """Factory: logit wrapper (Stata custom Newton-Raphson vs sklearn)."""
-    return _StataLogitModel() if stata_type else _SklearnLogitModel()
+    if custom_model is not None:
+        return _CustomModelWrapper(custom_model, is_classifier=True)
+    return _StataLogitModel() if asinstata else _SklearnLogitModel()
 
 
-def _make_glm_logit(stata_type: bool = True):
+def _make_glm_logit(asinstata: bool = True, custom_model=None):
     """Factory: logit wrapper used in cross-validation (smf.glm vs sklearn)."""
-    return _StataGLMLogitModel() if stata_type else _SklearnLogitModel()
+    if custom_model is not None:
+        return _CustomModelWrapper(custom_model, is_classifier=True)
+    return _StataGLMLogitModel() if asinstata else _SklearnLogitModel()
 
 
 # ============================================================
@@ -992,7 +1041,9 @@ def cross_validation_select(df: pd.DataFrame, outcome: str,
                             controls: Optional[List[str]] = None,
                             first_stage: bool = False,
                             reduced_form: bool = False,
-                            stata_type: bool = True) -> int:
+                            asinstata: bool = True,
+                            model_deltay=None,
+                            model_stayer=None) -> int:
     """
     K-fold cross-validation to select polynomial order.
     Returns the optimal order (integer).
@@ -1068,7 +1119,7 @@ def cross_validation_select(df: pd.DataFrame, outcome: str,
                     if len(train_valid) < len(covariates) + 1:
                         convergence_failures += 1
                         continue
-                    mod = _make_ols(stata_type).fit(formula, train_valid)
+                    mod = _make_ols(asinstata, model_deltay).fit(formula, train_valid)
                     pred = np.asarray(mod.predict(test), dtype=float)
                     resid = test[outcome].to_numpy(dtype=float) - pred
                     e_sq = np.nanmean(resid ** 2)
@@ -1079,7 +1130,7 @@ def cross_validation_select(df: pd.DataFrame, outcome: str,
                 try:
                     formula = f"{outcome} ~ {formula_rhs}"
                     train_valid = train[train[outcome].notna()].copy()
-                    mod = _make_glm_logit(stata_type).fit(formula, train_valid)
+                    mod = _make_glm_logit(asinstata, model_stayer).fit(formula, train_valid)
                     pred = np.asarray(mod.predict(test), dtype=float)
                     y_test = test[outcome].to_numpy(dtype=float)
                     pred = np.clip(pred, 1e-10, 1 - 1e-10)
@@ -1139,7 +1190,9 @@ def did_multiplegt_stat_pairwise(
     order_logit_Plus: Optional[int] = None,
     order_logit_Minus: Optional[int] = None,
     cf_folds_file: Optional[str] = None,
-    stata_type: bool = True,
+    asinstata: bool = True,
+    model_deltay=None,
+    model_stayer=None,
 ) -> Dict[str, Any]:
     """Pairwise DiD estimation between consecutive time periods."""
 
@@ -1588,7 +1641,7 @@ def did_multiplegt_stat_pairwise(
         else:
             ra_test_formula = f"delta_Y_XX ~ {reg_pol_terms}"
             try:
-                _cap_reg_model = _make_ols(stata_type).fit(ra_test_formula, df0_test)
+                _cap_reg_model = _make_ols(asinstata, model_deltay).fit(ra_test_formula, df0_test)
             except Exception:
                 feasible_est = False
     if not feasible_est and placebo_index > 0 and os.environ.get("DMS_DEBUG_PLACEBO"):
@@ -1673,10 +1726,10 @@ def did_multiplegt_stat_pairwise(
                     continue
                 try:
                     if use_logit:
-                        mod = _make_logit(stata_type).fit(formula, train, wcol=wcol)
+                        mod = _make_logit(asinstata, model_stayer).fit(formula, train, wcol=wcol)
                     else:
                         # Stata: reg ... (NO weights for polynomial regressions)
-                        mod = _make_ols(stata_type).fit(formula, train)
+                        mod = _make_ols(asinstata, model_deltay).fit(formula, train)
                     last_model = mod
                     test = lpredict(test, f"cf_{pred_col}", mod, prob=use_logit)
                     df_in.loc[test.index, f"cf_{pred_col}"] = test[f"cf_{pred_col}"]
@@ -1701,7 +1754,7 @@ def did_multiplegt_stat_pairwise(
             else:
                 ra_formula = f"delta_Y_XX ~ {reg_pol_terms}"
                 try:
-                    ra_model = _make_ols(stata_type).fit(ra_formula, df0)
+                    ra_model = _make_ols(asinstata, model_deltay).fit(ra_formula, df0)
                     df = lpredict(df, "mean_pred_XX", ra_model)
                 except Exception:
                     df["mean_pred_XX"] = 0.0
@@ -1722,7 +1775,7 @@ def did_multiplegt_stat_pairwise(
                 ps0_formula = f"S0_XX ~ {logit_bis_pol}"
                 ps0_model = None
                 try:
-                    ps0_model = _make_logit(stata_type).fit(ps0_formula, df)
+                    ps0_model = _make_logit(asinstata, model_stayer).fit(ps0_formula, df)
                     df = lpredict(df, "PS_0_D_1_XX", ps0_model, prob=True)
                 except Exception:
                     df["PS_0_D_1_XX"] = 0.5
@@ -1807,7 +1860,7 @@ def did_multiplegt_stat_pairwise(
                     df.loc[~_em_d1_ok, "mean_S_over_delta_D_XX"] = np.nan
             else:
                 # Stata: reg S_over_deltaD_XX ... (NO weights)
-                sdd_model = _make_ols(stata_type).fit(sdd_formula, df)
+                sdd_model = _make_ols(asinstata, model_deltay).fit(sdd_formula, df)
                 df = lpredict(df, "mean_S_over_delta_D_XX", sdd_model)
 
             # Cross-fitting for E[S/ΔD|D1]
@@ -2044,7 +2097,7 @@ def did_multiplegt_stat_pairwise(
                         ps1_formula = f"Ster_XX ~ {logit_pol}"
                         ps1_model = None
                         try:
-                            ps1_model = _make_logit(stata_type).fit(ps1_formula, df)
+                            ps1_model = _make_logit(asinstata, model_stayer).fit(ps1_formula, df)
                             df = lpredict(df, f"PS_1_{suffix}_D_1_XX", ps1_model, prob=True)
                         except Exception:
                             df[f"PS_1_{suffix}_D_1_XX"] = scalars[f"PS_{suffix}1{pl}_XX"]
@@ -2230,7 +2283,7 @@ def did_multiplegt_stat_pairwise(
             if not exact_match:
                 psiv0_formula = f"S_IV_0_XX ~ {IV_logit_bis_pol}"
                 try:
-                    psiv0_model = _make_logit(stata_type).fit(psiv0_formula, df)
+                    psiv0_model = _make_logit(asinstata, model_stayer).fit(psiv0_formula, df)
                     df = lpredict(df, "PS_IV_0_Z_1_XX", psiv0_model, prob=True)
                 except Exception:
                     df["PS_IV_0_Z_1_XX"] = 0.5
@@ -2257,7 +2310,7 @@ def did_multiplegt_stat_pairwise(
                         iv_logit_pol = IV_logit_Plus_pol if suffix == "Plus" else IV_logit_Minus_pol
                         psis_formula = f"{flag} ~ {iv_logit_pol}"
                         try:
-                            psis_model = _make_logit(stata_type).fit(psis_formula, df)
+                            psis_model = _make_logit(asinstata, model_stayer).fit(psis_formula, df)
                             df = lpredict(df, f"PS_I_{suffix}_1_Z_1_XX", psis_model, prob=True)
                         except Exception:
                             df[f"PS_I_{suffix}_1_Z_1_XX"] = scalars[f"PS_I_{suffix}_1{pl}_XX"]
@@ -2273,7 +2326,7 @@ def did_multiplegt_stat_pairwise(
                     mY_model = _svd_wls(mY_formula, df_temp, _ones_t, rcond=1e-7, use_float32=True)
                 else:
                     # Stata: reg deltaY_XX ... if SI_XX==0  (NO weights)
-                    mY_model = _make_ols(stata_type).fit(mY_formula, df_temp)
+                    mY_model = _make_ols(asinstata, model_deltay).fit(mY_formula, df_temp)
                 df = lpredict(df, "mean_delta_Y_pred_IV_XX", mY_model)
             except Exception:
                 df["mean_delta_Y_pred_IV_XX"] = 0.0
@@ -2286,7 +2339,7 @@ def did_multiplegt_stat_pairwise(
                     mD_model = _svd_wls(mD_formula, df_temp, _ones_t, rcond=1e-7, use_float32=True)
                 else:
                     # Stata: reg deltaD_XX ... if SI_XX==0  (NO weights)
-                    mD_model = _make_ols(stata_type).fit(mD_formula, df_temp)
+                    mD_model = _make_ols(asinstata, model_deltay).fit(mD_formula, df_temp)
                 df = lpredict(df, "mean_delta_D_pred_IV_XX", mD_model)
             except Exception:
                 df["mean_delta_D_pred_IV_XX"] = 0.0
@@ -2453,7 +2506,9 @@ def did_multiplegt_stat_main(
     seed: int = 0,
     cross_validation_opt: Optional[Dict[str, Any]] = None,
     cf_folds_file: Optional[str] = None,
-    stata_type: bool = True,
+    asinstata: bool = True,
+    model_deltay=None,
+    model_stayer=None,
 ) -> Dict[str, Any]:
     """Main aggregation function."""
 
@@ -2573,14 +2628,16 @@ def did_multiplegt_stat_main(
             df_cv[stayers_mask], "deltaYt_XX", model_type="reg",
             algorithm=cv_algorithm, tolerance=cv_tolerance, max_k=cv_max_k,
             seed=cv_seed, kfolds=cv_kfolds, controls=controls,
-            first_stage=is_fs, reduced_form=is_fs, stata_type=stata_type)
+            first_stage=is_fs, reduced_form=is_fs, asinstata=asinstata,
+            model_deltay=model_deltay, model_stayer=model_stayer)
 
         # 2) logit_bis order
         order_logit_bis = cross_validation_select(
             df_cv, s0_col, model_type="logit",
             algorithm=cv_algorithm, tolerance=cv_tolerance, max_k=cv_max_k,
             seed=cv_seed, kfolds=cv_kfolds, controls=controls,
-            first_stage=is_fs, reduced_form=is_fs, stata_type=stata_type)
+            first_stage=is_fs, reduced_form=is_fs, asinstata=asinstata,
+            model_deltay=model_deltay, model_stayer=model_stayer)
 
         if cv_same_order:
             order_logit_Plus = order_logit_bis
@@ -2598,7 +2655,8 @@ def did_multiplegt_stat_main(
                     df_cv, "StPlus_XX", model_type="logit",
                     algorithm=cv_algorithm, tolerance=cv_tolerance, max_k=cv_max_k,
                     seed=cv_seed, kfolds=cv_kfolds, controls=controls,
-                    first_stage=is_fs, reduced_form=is_fs, stata_type=stata_type)
+                    first_stage=is_fs, reduced_form=is_fs, asinstata=asinstata,
+            model_deltay=model_deltay, model_stayer=model_stayer)
             else:
                 order_logit_Plus = 0
 
@@ -2614,7 +2672,8 @@ def did_multiplegt_stat_main(
                     df_cv, "StMinus_XX", model_type="logit",
                     algorithm=cv_algorithm, tolerance=cv_tolerance, max_k=cv_max_k,
                     seed=cv_seed, kfolds=cv_kfolds, controls=controls,
-                    first_stage=is_fs, reduced_form=is_fs, stata_type=stata_type)
+                    first_stage=is_fs, reduced_form=is_fs, asinstata=asinstata,
+            model_deltay=model_deltay, model_stayer=model_stayer)
             else:
                 order_logit_Minus = 0
 
@@ -2649,7 +2708,9 @@ def did_multiplegt_stat_main(
         order_reg=order_reg, order_logit_bis=order_logit_bis,
         order_logit_Plus=order_logit_Plus, order_logit_Minus=order_logit_Minus,
         cf_folds_file=cf_folds_file,
-        stata_type=stata_type,
+        asinstata=asinstata,
+        model_deltay=model_deltay,
+        model_stayer=model_stayer,
     )
 
     # --- MAIN EFFECTS LOOP ---
@@ -3108,7 +3169,9 @@ def did_multiplegt_stat(
     cross_validation: Optional[Dict[str, Any]] = None,
     iv_method: str = "manual",
     cf_folds_file: Optional[str] = None,
-    stata_type: bool = False,
+    asinstata: bool = False,
+    model_deltay=None,
+    model_stayer=None,
 ) -> Dict[str, Any]:
     """
     Python interface for did_multiplegt_stat.
@@ -3134,11 +3197,19 @@ def did_multiplegt_stat(
     cf_folds_file : str, optional - Path to CSV with cross-fitting fold IDs exported by Stata.
         Columns: pairwise, placebo_index, estimator_type, ID_XX, cf_sample_id.
         When provided, fold assignments are read from this file instead of generated internally.
-    stata_type : bool, default False - If True, use Stata-faithful regressions
+    asinstata : bool, default False - If True, use Stata-faithful regressions
         (custom Newton-Raphson logit + statsmodels OLS).  If False (default),
         use scikit-learn LinearRegression / LogisticRegression for all OLS and
         logit estimations.  Note: changing this flag changes numerical results;
-        Stata parity tests require stata_type=True.
+        Stata parity tests require asinstata=True.
+    model_deltay : object, optional - Custom regression model for E[DeltaY|D1,S=0].
+        Must implement .fit(X, y) and .predict(X) (sklearn-style). When provided,
+        overrides the default OLS model (regardless of asinstata). Example:
+        RandomForestRegressor(n_estimators=100).
+    model_stayer : object, optional - Custom classification model for P(stayer|D1).
+        Must implement .fit(X, y) and .predict_proba(X) (sklearn-style). When
+        provided, overrides the default logit model (regardless of asinstata).
+        Example: RandomForestClassifier(n_estimators=100).
     """
     if switchers is not None and switchers not in ("up", "down"):
         raise ValueError("Switchers must be None, 'up' or 'down'.")
@@ -3254,7 +3325,9 @@ def did_multiplegt_stat(
             "on_placebo_sample": on_placebo_sample,
             "bootstrap": bootstrap, "twfe": twfe,
             "iv_method": iv_method,
-            "stata_type": stata_type,
+            "asinstata": asinstata,
+            "model_deltay": model_deltay,
+            "model_stayer": model_stayer,
         }
     }
 
@@ -3327,7 +3400,9 @@ def did_multiplegt_stat(
             on_placebo_sample=on_placebo_sample,
             cross_validation=cross_validation,
             cf_folds_file=cf_folds_file,
-            stata_type=stata_type,
+            asinstata=asinstata,
+            model_deltay=model_deltay,
+            model_stayer=model_stayer,
         )
         out["first_stage"] = fs_result
         print("=" * 80)
@@ -3350,7 +3425,9 @@ def did_multiplegt_stat(
             bootstrap=bootstrap, twfe=twfe_active, seed=seed,
             cross_validation_opt=cross_validation,
             cf_folds_file=cf_folds_file,
-            stata_type=stata_type,
+            asinstata=asinstata,
+            model_deltay=model_deltay,
+            model_stayer=model_stayer,
         )
 
     if mode == "_no_by":
@@ -3376,7 +3453,9 @@ def did_multiplegt_stat(
                        bootstrap, twfe_active, seed, cross_validation,
                        twfe_same_sample=twfe_same_sample,
                        twfe_percentile=twfe_percentile,
-                       stata_type=stata_type)
+                       asinstata=asinstata,
+                       model_deltay=model_deltay,
+                       model_stayer=model_stayer)
 
     out["_class"] = "did_multiplegt_stat"
     return out
@@ -3394,7 +3473,8 @@ def _run_bootstrap(out, df_work, Y, ID, Time, D, Z, estimator_list,
                    order_logit_Plus, order_logit_Minus,
                    n_bootstrap, twfe, seed, cross_validation,
                    twfe_same_sample=False, twfe_percentile=False,
-                   stata_type=True):
+                   asinstata=True,
+                   model_deltay=None, model_stayer=None):
     """Run bootstrap for IV-WAS SEs and/or TWFE comparison."""
 
     results_key = "results"
@@ -3455,7 +3535,9 @@ def _run_bootstrap(out, df_work, Y, ID, Time, D, Z, estimator_list,
                 order_reg=order_reg, order_logit_bis=order_logit_bis,
                 order_logit_Plus=order_logit_Plus, order_logit_Minus=order_logit_Minus,
                 cross_validation_opt=cross_validation,
-                stata_type=stata_type,
+                asinstata=asinstata,
+                model_deltay=model_deltay,
+                model_stayer=model_stayer,
             )
             tbl = res_bt.get("table", None)
             if isinstance(tbl, pd.DataFrame):
